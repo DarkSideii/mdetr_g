@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch import Tensor
 
-from multimodal_framework.mdetr.util.dist import is_main_process as _is_main_process
+from mdetr.util.dist import is_main_process as _is_main_process
 
 
 def get_sha() -> str:

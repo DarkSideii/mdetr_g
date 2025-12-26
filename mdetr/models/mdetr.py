@@ -6,9 +6,9 @@ import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 
-import multimodal_framework.mdetr.util.dist as dist
-from multimodal_framework.mdetr.util import box_ops
-from multimodal_framework.mdetr.util.misc import NestedTensor, interpolate
+import mdetr.util.dist as dist
+from mdetr.util import box_ops
+from mdetr.util.misc import NestedTensor, interpolate
 from .backbone import build_backbone
 from .matcher import build_matcher
 from .segmentation import dice_loss, sigmoid_focal_loss
@@ -41,6 +41,7 @@ class MDETR(nn.Module):
         qa_dataset: Optional[str] = None,
         split_qa_heads: bool = True,
         predict_final: bool = False,
+        align_scale_mode: str = "learnable",
     ):
         super().__init__()
 
@@ -94,7 +95,18 @@ class MDETR(nn.Module):
         if contrastive_align_loss:
             self.contrastive_align_projection_image = nn.Linear(hidden_dim, contrastive_hdim)
             self.contrastive_align_projection_text = nn.Linear(hidden_dim, contrastive_hdim)
+
+            # keep the tensor in the state_dict either way (helps loading checkpoints across modes)
             self.logit_scale_align = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
+            self.align_scale_mode = align_scale_mode
+
+            if self.align_scale_mode == "learnable":
+                self.logit_scale_align.requires_grad_(True)
+            elif self.align_scale_mode == "hardcoded":
+                # exists, but is not trained and will be ignored in the loss computation
+                self.logit_scale_align.requires_grad_(False)
+            else:
+                raise ValueError(f"Unknown align_scale_mode={self.align_scale_mode!r}")
         else:
             self.logit_scale_align = None
 
@@ -260,6 +272,18 @@ class MDETR(nn.Module):
             # Aux losses from intermediate decoder layers
             if self.aux_loss:
                 if self.contrastive_align_loss:
+                    align_scale = None
+                    if self.align_scale_mode == "learnable" and (self.logit_scale_align is not None):
+                        align_scale = self.logit_scale_align.exp().clamp(max=100.0)
+                    payload = {
+                        "proj_queries": proj_queries[-1],
+                        "proj_tokens": proj_tokens,
+                        "tokenized": memory_cache["tokenized"],
+                    }
+                    if align_scale is not None:
+                        payload["logit_scale_align"] = align_scale
+                    out.update(payload)
+
                     assert proj_tokens is not None and proj_queries is not None
                     out["aux_outputs"] = [
                         {
@@ -268,6 +292,7 @@ class MDETR(nn.Module):
                             "proj_queries": c,
                             "proj_tokens": proj_tokens,
                             "tokenized": memory_cache["tokenized"],
+                            **({"logit_scale_align": align_scale} if align_scale is not None else {}),
                         }
                         for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], proj_queries[:-1])
                     ]
@@ -496,13 +521,14 @@ class QACriterionClevr(nn.Module):
 class SetCriterion(nn.Module):
     """Loss computation for DETR-like models."""
 
-    def __init__(self, num_classes, matcher, eos_coef, losses, temperature):
+    def __init__(self, num_classes, matcher, eos_coef, losses, temperature, align_scale_mode: str = "learnable"):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.eos_coef = eos_coef
         self.losses = losses
         self.temperature = temperature
+        self.align_scale_mode = align_scale_mode
 
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
@@ -556,11 +582,17 @@ class SetCriterion(nn.Module):
         normalized_img_emb = outputs["proj_queries"]   # [B, Q, h]
 
         # Use model-provided scale if present; otherwise fall back to 1/temperature
-        scale = outputs.get("logit_scale_align", None)
-        if scale is None:
+        if self.align_scale_mode == "learnable":
+            scale = outputs.get("logit_scale_align", None)
+            if scale is None:
+                # fallback: behave like hardcoded if scale wasn't provided
+                logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) / self.temperature
+            else:
+                logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) * scale
+        elif self.align_scale_mode == "hardcoded":
             logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) / self.temperature
         else:
-            logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) * scale
+            raise ValueError(f"Unknown align_scale_mode={self.align_scale_mode!r}")
 
         # Mask PAD tokens (attention_mask: 1=valid, 0=PAD)
         if hasattr(tokenized, "attention_mask"):
@@ -784,6 +816,7 @@ def build(args):
         contrastive_hdim=args.contrastive_loss_hdim,
         contrastive_loss=args.contrastive_loss,
         contrastive_align_loss=args.contrastive_align_loss,
+        align_scale_mode=getattr(args, "align_scale_mode", "learnable")
     )
 
     matcher = build_matcher(args)
@@ -821,6 +854,7 @@ def build(args):
             eos_coef=args.eos_coef,
             losses=losses,
             temperature=args.temperature_NCE,
+            align_scale_mode=getattr(args, "align_scale_mode", "learnable"),
         ).to(device)
 
     if args.contrastive_loss:
@@ -832,7 +866,7 @@ def build(args):
     extra = []
     if hasattr(model, "logit_scale_cls") and model.logit_scale_cls is not None:
         extra.append(model.logit_scale_cls)
-    if hasattr(model, "logit_scale_align") and model.logit_scale_align is not None:
+    if model.logit_scale_align is not None and model.logit_scale_align.requires_grad:
         extra.append(model.logit_scale_align)
 
     model.extra_optim_groups = []

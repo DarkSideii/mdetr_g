@@ -5,10 +5,10 @@ from typing import Dict, Iterable, Optional
 import torch
 import torch.nn as nn
 
-import multimodal_framework.mdetr.util.dist as dist
-from multimodal_framework.mdetr.util.metrics import MetricLogger, SmoothedValue
-from multimodal_framework.mdetr.util.misc import targets_to
-from multimodal_framework.mdetr.util.optim import adjust_learning_rate, update_ema
+import mdetr.util.dist as dist
+from mdetr.util.metrics import MetricLogger, SmoothedValue
+from mdetr.util.misc import targets_to
+from mdetr.util.optim import adjust_learning_rate, update_ema
 
 
 # Only log the main losses (keep total "loss" too)

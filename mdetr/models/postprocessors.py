@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from multimodal_framework.mdetr.util import box_ops
+from mdetr.util import box_ops
 
 
 class PostProcessFlickr(nn.Module):

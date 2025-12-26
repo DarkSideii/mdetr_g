@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import AutoModel, AutoTokenizer
-
+from .transformer_vanilla import VanillaTransformer
 # ---- Try to import the CUDA op from MMCV -----------------------------------
 _HAS_MMCV = False
 try:
@@ -641,6 +641,25 @@ class Transformer(nn.Module):
 
 # ------------------------- factory (build_transformer) ----------------------
 def build_transformer(args):
+    ttype = getattr(args, "transformer_type", "deformable").lower()
+    if ttype == "vanilla":
+        return VanillaTransformer(
+            d_model=args.hidden_dim,
+            dropout=args.dropout,
+            nhead=args.nheads,
+            dim_feedforward=args.dim_feedforward,
+            num_encoder_layers=args.enc_layers,
+            num_decoder_layers=args.dec_layers,
+            normalize_before=args.pre_norm,
+            return_intermediate_dec=True,
+            pass_pos_and_query=True,
+            text_encoder_type=args.text_encoder_type,
+            freeze_text_encoder=args.freeze_text_encoder,
+            contrastive_loss=args.contrastive_loss,
+            use_text_cross_attn=getattr(args, "use_text_cross_attn", True),
+        )
+
+    # default: deformable
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,

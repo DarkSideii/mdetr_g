@@ -26,15 +26,13 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 # ----------------- project utilities -----------------
-import multimodal_framework.mdetr.util.misc as utils
-from multimodal_framework.mdetr.engine import train_one_epoch, evaluate
-from multimodal_framework.mdetr.models import build_model
-from multimodal_framework.mdetr.models.postprocessors import build_postprocessors
-from multimodal_framework.mdetr.util.misc import NestedTensor, collate_fn  # noqa: F401 (may be unused)
+import mdetr.util.misc as utils
+from mdetr.engine import train_one_epoch, evaluate
+from mdetr.models import build_model
+from mdetr.models.postprocessors import build_postprocessors
 
-# ----------------- RarePlanes dataset ----------------
+# ----------------- Geo datasets ----------------
 from geo_datasets import build_dataset, get_evaluator
-
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +141,33 @@ def get_args_parser():
     group.add_argument("--use_text_cross_attn", dest="use_text_cross_attn", action="store_true", help="Enable decoder cross-attention to text tokens")
     group.add_argument("--no_text_cross_attn", dest="use_text_cross_attn", action="store_false", help="Disable decoder cross-attention to text tokens")
     p.set_defaults(use_text_cross_attn=True)
-    p.add_argument("--dataset_file", default="rareplanes",   choices=("rareplanes", "dota", "hrsc", "fair1m"),
-                   help="Which dataset to use")
+
+    p.add_argument(
+        "--dataset_file",
+        default="dior_rsvg",
+        choices=("dior_rsvg",),
+        help="Which dataset to use (fresh start: DIOR-RSVG).",
+    )
+
+    p.add_argument(
+        "--transformer_type",
+        default="deformable",
+        choices=("deformable", "vanilla"),
+        help="deformable = MSDeformAttn (MMCV); vanilla = standard MultiheadAttention (no deformable attn).",
+    )
+    p.add_argument(
+        "--no_deformable_attn",
+        action="store_true",
+        help="Alias for --transformer_type vanilla",
+    )
+    p.add_argument(
+        "--align_scale_mode",
+        default="learnable",
+        choices=("learnable", "hardcoded"),
+        help="Ablation: learnable uses model logit_scale_align, hardcoded uses 1/temperature_NCE.",
+    )
     return p
+
 
 def count_params_model(model):
     total = 0
@@ -212,6 +234,7 @@ def report_trainable_by_group(optimizer):
         "rows": rows,
     }
 
+
 def _flatten_metrics_for_mlflow(d, prefix=""):
     """
     Convert a nested dict of metrics into MLflow-safe flat scalars.
@@ -253,7 +276,6 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
                     flat[name + "/min"] = float(arr.min())
                     flat[name + "/max"] = float(arr.max())
             except Exception:
-                # skip non-numeric lists
                 pass
             continue
 
@@ -262,7 +284,6 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
             flat.update(_flatten_metrics_for_mlflow(v, prefix=name + "/"))
             continue
 
-        # Everything else: skip
     return flat
 
 
@@ -275,6 +296,14 @@ def main(args):
         with open(args.dataset_config) as f:
             vars(args).update(json.load(f))
 
+    # Flag alias resolution
+    if getattr(args, "no_deformable_attn", False):
+        args.transformer_type = "vanilla"
+
+    # If vanilla transformer, force single feature level (DETR/MDETR style)
+    if getattr(args, "transformer_type", "deformable") == "vanilla":
+        args.num_feature_levels = 1
+
     print("==== ARGS ====\n", args)
 
     # reproducibility
@@ -284,10 +313,12 @@ def main(args):
     try:
         torch.use_deterministic_algorithms(True, warn_only=True)
     except TypeError:
-        # Older PyTorch
         torch.set_deterministic(True)
 
     is_main = utils.is_main_process()  # ← for safe logging in DDP/multiprocess
+
+    # treat eval + test as "eval mode" (held-out set, 100%)
+    eval_mode = bool(getattr(args, "eval", False)) or bool(getattr(args, "test", False))
 
     # ----------------- MLFLOW RUN -----------------
     with mlflow.start_run(run_name=args.run_name or None):
@@ -324,14 +355,22 @@ def main(args):
             print(f"[EMA] enabled (decay={args.ema_decay}). EMA weights will be used for eval/checkpoints.")
 
         # ---------------- optimiser ----------------
+        extra_groups = getattr(model, "extra_optim_groups", [])
+        extra_param_ids = {id(p) for g in extra_groups for p in g.get("params", []) if p is not None}
+
         backbone_params, textenc_params, base_params = [], [], []
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
+
+            # keep extra params OUT of base/backbone/text groups
+            if id(p) in extra_param_ids:
+                continue
+
             if n.startswith("backbone."):
                 backbone_params.append(p)
             elif n.startswith("transformer.text_encoder."):
-                textenc_params.append(p)  # will be empty if --freeze_text_encoder
+                textenc_params.append(p)
             else:
                 base_params.append(p)
 
@@ -352,8 +391,7 @@ def main(args):
             },
         ]
 
-        # only add text group if it actually has trainable params
-        if len(textenc_params) > 0 and hasattr(args, "text_encoder_lr"):
+        if len(textenc_params) > 0:
             param_groups.append(
                 {
                     "name": "text",
@@ -364,21 +402,20 @@ def main(args):
                 }
             )
 
-        # ---- append extra groups (e.g., learnable logit scales) LAST ----
-        if hasattr(model, "extra_optim_groups"):
-            already = {id(p) for g in param_groups for p in g["params"]}
-            for g in model.extra_optim_groups:
-                params = [p for p in g["params"] if p.requires_grad and id(p) not in already]
-                if params:
-                    param_groups.append(
-                        {
-                            "name": g.get("name", "extra"),
-                            "params": params,
-                            "lr": g.get("lr", args.lr),
-                            "base_lr": g.get("base_lr", g.get("lr", args.lr)),
-                            "weight_decay": g.get("weight_decay", 0.0),
-                        }
-                    )
+        # Append extra groups LAST (e.g., logit scales)
+        already = {id(p) for g in param_groups for p in g["params"]}
+        for g in extra_groups:
+            params = [p for p in g.get("params", []) if p is not None and p.requires_grad and id(p) not in already]
+            if params:
+                param_groups.append(
+                    {
+                        "name": g.get("name", "extra"),
+                        "params": params,
+                        "lr": g.get("lr", args.lr),
+                        "base_lr": g.get("base_lr", g.get("lr", args.lr)),
+                        "weight_decay": g.get("weight_decay", 0.0),
+                    }
+                )
 
         # Normalize optimizer choice
         opt = str(getattr(args, "optimizer", "adamw")).lower()
@@ -398,7 +435,6 @@ def main(args):
             mlflow.log_param("n_parameters_total", int(total_params))
             mlflow.log_param("n_parameters_requires_grad", int(trainable_params))
 
-        # Accurate counts & audit
         opt_stats = report_trainable_by_group(optimizer)
 
         missing_from_optimizer = trainable_params - opt_stats["in_optimizer_dedup_requires_grad"]
@@ -411,30 +447,52 @@ def main(args):
             mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", int(effective_trainable))
 
         # ---------------- datasets ----------------
-        ds_train = build_dataset(args.dataset_file, "train", args)
-        ds_val = build_dataset(args.dataset_file, "val", args)
-        print(f" train images: {len(ds_train)}\n val images: {len(ds_val)}")
+        if eval_mode:
+            # eval/test mode: ONLY build held-out set (100%)
+            ds_val = build_dataset(args.dataset_file, "test", args)
+            print(f" eval images: {len(ds_val)}")
 
-        dl_train = DataLoader(
-            ds_train,
-            batch_sampler=torch.utils.data.BatchSampler(RandomSampler(ds_train), args.batch_size, drop_last=True),
-            collate_fn=partial(utils.collate_fn, False),
-            num_workers=4,
-            pin_memory=False,
-            persistent_workers=False,
-            prefetch_factor=2,
-        )
-        dl_val = DataLoader(
-            ds_val,
-            batch_size=args.batch_size,
-            sampler=SequentialSampler(ds_val),
-            drop_last=False,
-            collate_fn=partial(utils.collate_fn, False),
-            num_workers=2,
-            pin_memory=False,
-            persistent_workers=False,
-            prefetch_factor=1,
-        )
+            dl_val = DataLoader(
+                ds_val,
+                batch_size=args.batch_size,
+                sampler=SequentialSampler(ds_val),
+                drop_last=False,
+                collate_fn=partial(utils.collate_fn, False),
+                num_workers=2,
+                pin_memory=False,
+                persistent_workers=False,
+                prefetch_factor=1,
+            )
+
+            # placeholders (not used in eval mode)
+            ds_train = None
+            dl_train = None
+        else:
+            # train mode: build train + val (split handled by dataset code)
+            ds_train = build_dataset(args.dataset_file, "train", args)
+            ds_val = build_dataset(args.dataset_file, "val", args)
+            print(f" train images: {len(ds_train)}\n val images: {len(ds_val)}")
+
+            dl_train = DataLoader(
+                ds_train,
+                batch_sampler=torch.utils.data.BatchSampler(RandomSampler(ds_train), args.batch_size, drop_last=True),
+                collate_fn=partial(utils.collate_fn, False),
+                num_workers=4,
+                pin_memory=False,
+                persistent_workers=False,
+                prefetch_factor=2,
+            )
+            dl_val = DataLoader(
+                ds_val,
+                batch_size=args.batch_size,
+                sampler=SequentialSampler(ds_val),
+                drop_last=False,
+                collate_fn=partial(utils.collate_fn, False),
+                num_workers=2,
+                pin_memory=False,
+                persistent_workers=False,
+                prefetch_factor=1,
+            )
 
         # evaluator & post-processofdjhbfsdjbfdsj
         postprocessors = build_postprocessors(args, args.dataset_file)
@@ -458,7 +516,7 @@ def main(args):
         if args.resume and not args.load:
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model"], strict=True)
-            if "optimizer" in ckpt and not args.eval:
+            if "optimizer" in ckpt and not eval_mode:
                 optimizer.load_state_dict(ckpt["optimizer"])
             args.start_epoch = ckpt.get("epoch", 0) + 1
 
@@ -473,11 +531,20 @@ def main(args):
 
         # ---------------- evaluation only ----------------
         EvaluatorCls = get_evaluator(args.dataset_file)
-        if args.eval:
+        if eval_mode:
             test_model = model_ema if model_ema is not None else model
             evaluator = EvaluatorCls(ds_val, use_cats=False)
-            stats = evaluate(test_model, criterion, contrastive_criterion, weight_dict,
-                             dl_val, postprocessors, [evaluator], device, args)
+            stats = evaluate(
+                test_model,
+                criterion,
+                contrastive_criterion,
+                weight_dict,
+                dl_val,
+                postprocessors,
+                [evaluator],
+                device,
+                args,
+            )
             print(json.dumps({f"test_{k}": v for k, v in stats.items()}, indent=2))
             return
 

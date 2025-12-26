@@ -17,7 +17,7 @@ import torch
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-from multimodal_framework.mdetr.util.dist import all_gather
+from mdetr.util.dist import all_gather
 
 
 class CocoEvaluator(object):

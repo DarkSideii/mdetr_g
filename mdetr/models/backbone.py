@@ -16,7 +16,7 @@ from timm.models import create_model
 from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 
-from multimodal_framework.mdetr.util.misc import NestedTensor
+from mdetr.util.misc import NestedTensor
 from .position_encoding import build_position_encoding
 
 import satlaspretrain_models as sat
@@ -300,8 +300,13 @@ def _normalize_backbone_name(name: str) -> str:
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = getattr(args, "lr_backbone", 0.0) > 0.0
-    return_interm_layers = (getattr(args, "num_feature_levels", 1) > 1) or args.masks
-    k = getattr(args, "num_feature_levels", 1)
+    ttype = getattr(args, "transformer_type", "deformable").lower()
+    if ttype == "vanilla":
+        k = 1
+        return_interm_layers = bool(args.masks)
+    else:
+        k = getattr(args, "num_feature_levels", 1)
+        return_interm_layers = (k > 1) or args.masks
 
     backbone = None
 

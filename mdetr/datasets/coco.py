@@ -12,7 +12,7 @@ import torch.utils.data
 import torchvision
 from pycocotools import mask as coco_mask
 
-import multimodal_framework.mdetr.datasets.transforms as T
+import mdetr.datasets.transforms as T
 
 
 class ModulatedDetection(torchvision.datasets.CocoDetection):

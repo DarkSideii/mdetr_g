@@ -1,0 +1,10 @@
+{
+  "train_images_dir": "s3://research-mdetr-g/DIOR-RSVG/train_images/",
+  "train_annotations_dir": "s3://research-mdetr-g/DIOR-RSVG/train_annotations/",
+  "val_split_ratio": 0.1,
+
+  "eval_images_dir": "s3://research-mdetr-g/DIOR-RSVG/test_images/",
+  "eval_annotations_dir": "s3://research-mdetr-g/DIOR-RSVG/test_annotations/",
+
+  "max_text_len": 255
+}

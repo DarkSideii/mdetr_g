@@ -10,8 +10,8 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 from torchvision.transforms import InterpolationMode
-from multimodal_framework.mdetr.util.box_ops import box_xyxy_to_cxcywh
-from multimodal_framework.mdetr.util.misc import interpolate
+from mdetr.util.box_ops import box_xyxy_to_cxcywh
+from mdetr.util.misc import interpolate
 
 
 def crop(image, target, region):
