@@ -63,7 +63,12 @@ mmcv.ops.multi_scale_deform_attn.MultiScaleDeformableAttention.
 pip install --index-url https://download.pytorch.org/whl/cu130 \
   torch==2.9.1+cu130 torchvision==0.24.1 torchaudio==2.9.1
 
-# 2) Build MMCV w/ CUDA ops (example: local clone kept gitignored as ./mmcv)
+# 2) Install the requirements
+pip install -r requirements.txt \
+  --index-url https://download.pytorch.org/whl/cu130 \
+  --extra-index-url https://pypi.org/simple
+
+# 3) Build MMCV w/ CUDA ops (example: local clone kept gitignored as ./mmcv)
 cd mmcv
 export MMCV_WITH_OPS=1
 export FORCE_CUDA=1
@@ -71,6 +76,17 @@ export TORCH_CUDA_ARCH_LIST="12.1"
 export MAX_JOBS="$(nproc)"
 pip install -e . -v --no-build-isolation
 
-# 3) Verify deformable attention op loads
+# 4) Verify compiled extension + deformable attention op loads
+python -c "import mmcv; import mmcv._ext; print('mmcv._ext OK')"
 python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention; print('MSDA OK')"
 ```
+## Python version
+
+All experiments were ran with **Python 3.11 (tested on 3.11.9)**.
+
+**Why 3.11?**
+- On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack we used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
+- Python 3.11 generally has the broadest support across the ecosystem for compiled ML/CV dependencies.
+
+**Setup note (pyenv):**
+If you install Python via `pyenv`, make sure `liblzma-dev` is installed *before* building Python, otherwise the stdlib `lzma` module may be missing (`ModuleNotFoundError: No module named '_lzma'`).
