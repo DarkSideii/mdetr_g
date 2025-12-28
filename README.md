@@ -28,3 +28,49 @@ Given an image and a natural-language query, MDETR-G predicts bounding boxes cor
 
 ## Evaluation note (terminology)
 
+## Training environment (DGX Spark)
+
+All experiments reported for **MDETR-G** were run on an **NVIDIA DGX Spark** (Grace Blackwell) system.
+
+- **GPU:** NVIDIA **GB10** (Blackwell architecture, **sm_121 / compute capability 12.1**)
+- **Memory:** **128 GB** coherent **unified system memory** (shared between CPU and GPU).  
+  *Note:* tooling may report slightly less usable “GPU memory” due to reservations/overhead.
+
+Quick sanity checks:
+```bash
+nvidia-smi
+python -c "import torch; print(torch.cuda.get_device_name(0)); print(round(torch.cuda.get_device_properties(0).total_memory/1024**3, 2), 'GB')"
+```
+### Deformable attention (MMCV) on DGX Spark
+
+The deformable transformer path uses MMCV’s CUDA op:
+mmcv.ops.multi_scale_deform_attn.MultiScaleDeformableAttention.
+
+**On DGX Spark (Linux aarch64 + CUDA 13.x + sm_121), we had to:**
+
+- install a CUDA-enabled PyTorch build compatible with Spark (cu130 wheels), and
+- build MMCV from source with CUDA ops enabled (otherwise mmcv._ext is missing and deformable attention won’t load).
+
+#### What we did (summary)
+
+- Installed PyTorch from the CUDA 13 wheel index (cu130)
+- Cloned MMCV and built/install with ops enabled, targeting GB10 (TORCH_CUDA_ARCH_LIST="12.1")
+- Disabled pip build isolation so MMCV can “see” the installed torch when compiling ops
+
+**Repo Commands**
+```bash
+# 1) PyTorch (CUDA 13)
+pip install --index-url https://download.pytorch.org/whl/cu130 \
+  torch==2.9.1+cu130 torchvision==0.24.1 torchaudio==2.9.1
+
+# 2) Build MMCV w/ CUDA ops (example: local clone kept gitignored as ./mmcv)
+cd mmcv
+export MMCV_WITH_OPS=1
+export FORCE_CUDA=1
+export TORCH_CUDA_ARCH_LIST="12.1"
+export MAX_JOBS="$(nproc)"
+pip install -e . -v --no-build-isolation
+
+# 3) Verify deformable attention op loads
+python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention; print('MSDA OK')"
+```
