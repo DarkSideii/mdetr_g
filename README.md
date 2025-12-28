@@ -12,14 +12,13 @@ MDETR-G modifies the original MDETR design in a few key ways:
 - **Deformable attention** for more efficient multi-scale spatial reasoning (especially helpful in high-resolution imagery).
 - **Swin Transformer backbone** tuned for aerial/overhead imagery (stronger hierarchical feature extraction than natural-image backbones). 
 - **Learnable contrastive temperature (τ)** in the text–image alignment objective (rather than a fixed constant).  
-- **Shallower transformer (3 encoder / 3 decoder layers)** to improve training/inference efficiency. :contentReference[oaicite:5]{index=5}  
+- **Shallower transformer (3 encoder / 3 decoder layers)** to improve training/inference efficiency.
 
 Under the hood, MDETR-G still uses:
 - Hungarian matching (set prediction),
 - box regression losses (L1 + GIoU),
 - soft token prediction,
-- contrastive alignment between token and region embeddings. :contentReference[oaicite:6]{index=6}  
-
+- contrastive alignment between token and region embeddings.
 
 ## Core capability
 
