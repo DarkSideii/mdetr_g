@@ -46,12 +46,12 @@ python -c "import torch; print(torch.cuda.get_device_name(0)); print(round(torch
 The deformable transformer path uses MMCV’s CUDA op:
 mmcv.ops.multi_scale_deform_attn.MultiScaleDeformableAttention.
 
-**On DGX Spark (Linux aarch64 + CUDA 13.x + sm_121), we had to:**
+**On DGX Spark (Linux aarch64 + CUDA 13.x + sm_121), what was done:**
 
 - install a CUDA-enabled PyTorch build compatible with Spark (cu130 wheels), and
 - build MMCV from source with CUDA ops enabled (otherwise mmcv._ext is missing and deformable attention won’t load).
 
-#### What we did (summary)
+#### Summary
 
 - Installed PyTorch from the CUDA 13 wheel index (cu130)
 - Cloned MMCV and built/install with ops enabled, targeting GB10 (TORCH_CUDA_ARCH_LIST="12.1")
