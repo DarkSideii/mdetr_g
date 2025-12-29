@@ -894,7 +894,7 @@ def build_dior_rsvg(set_name: str, args):
 
     ids_all = list(full.ids_all)
 
-    debug_n = int(getattr(args, "debug_print_n", 0) or 0)
+    debug_n = getattr(args, "debug_print_n", 10)
     debug_seed = int(getattr(args, "seed", 42))
 
     if eval_mode:
