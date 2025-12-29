@@ -2,3 +2,6 @@
 venv/
 mmcv/
 .python-version
+*_cache/
+runs/
+mlruns/
