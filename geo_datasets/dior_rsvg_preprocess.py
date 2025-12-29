@@ -5,8 +5,10 @@ import hashlib
 import io
 import json
 import random
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -23,6 +25,13 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 import mdetr.datasets.transforms as T
+from util.augs import (
+    RandomColorJitter,
+    RandomGaussianBlur,
+    RandomRotate90,
+    RandomVerticalFlip,
+    RandomGaussianNoise
+)
 
 # ─────────────────────────────── S3 config ────────────────────────────────
 _S3_CFG = Config(
@@ -33,8 +42,11 @@ _S3_CFG = Config(
 
 # ─────────────────────────────── cache base ────────────────────────────────
 _THIS_DIR = Path(__file__).resolve().parent
-_CACHE_BASE = _THIS_DIR / "dior_rsvg_cache"
+_CACHE_BASE = _THIS_DIR.parent / "dior_rsvg_cache"
 _CACHE_BASE.mkdir(parents=True, exist_ok=True)
+
+# Bump this if you change dataset materialization format (prevents stale parquet reuse)
+_CACHE_VERSION = "dior_rsvg_per_object_caption_objspan_v3"
 
 
 # ────────────────────────────── helpers ──────────────────────────────
@@ -84,6 +96,88 @@ def _cache_key(*parts: str) -> str:
 def _xyxy_to_xywh(b):
     x1, y1, x2, y2 = b
     return [x1, y1, x2 - x1, y2 - y1]
+
+
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _norm_alnum(s: str) -> str:
+    """Lowercase and keep only [a-z0-9]."""
+    if not s:
+        return ""
+    return "".join(ch.lower() for ch in s if ch.isalnum())
+
+
+def _find_object_mention_span(
+    caption: str,
+    cls_name: str,
+    max_ngram_words: int = 6,
+    min_ratio: float = 0.55,
+) -> Optional[Tuple[int, int]]:
+    """
+    Find a character span in `caption` that best corresponds to `cls_name`.
+
+    We try to match the *object phrase* inside the full caption, NOT the whole caption.
+    Works for:
+      - groundtrackfield  vs  "ground track field"
+      - baseballfield     vs  "baseball field"
+      - partial mentions: groundtrackfield vs "track field"
+
+    Returns (tok_beg, tok_end) as character indices into caption, end-exclusive.
+    Returns None if no good match is found.
+    """
+    caption = caption or ""
+    cls_norm = _norm_alnum(cls_name or "")
+    if not caption or not cls_norm:
+        return None
+
+    words = [(m.group(0), m.start(), m.end()) for m in _WORD_RE.finditer(caption)]
+    if not words:
+        return None
+
+    best_span: Optional[Tuple[int, int]] = None
+    best_key: Tuple[float, int, int] = (-1.0, 0, 0)  # (score, -start, -span_len)
+
+    n = len(words)
+    for i in range(n):
+        for j in range(i, min(n, i + max_ngram_words)):
+            start = words[i][1]
+            end = words[j][2]
+            span_len = end - start
+
+            # Normalized phrase = concatenation of the selected words (spaces removed)
+            phrase_norm = "".join(words[k][0].lower() for k in range(i, j + 1))
+            if not phrase_norm:
+                continue
+
+            # Score: prefer exact, then substring, then fuzzy ratio
+            if phrase_norm == cls_norm:
+                score = 3.0
+            elif phrase_norm in cls_norm:
+                # caption uses subset of class (e.g. "trackfield" in "groundtrackfield")
+                score = 2.0 + (len(phrase_norm) / max(1, len(cls_norm)))
+            elif cls_norm in phrase_norm:
+                # caption phrase contains class but with extra words (penalize extras)
+                score = 2.0 + (len(cls_norm) / max(1, len(phrase_norm)))
+            else:
+                score = SequenceMatcher(None, phrase_norm, cls_norm).ratio()
+
+            # Tie-breaks:
+            # - earlier start preferred
+            # - shorter span preferred (keeps just the object phrase, not adjectives)
+            key = (float(score), -start, -span_len)
+            if key > best_key:
+                best_key = key
+                best_span = (start, end)
+
+    if best_span is None:
+        return None
+
+    # If it’s only a fuzzy ratio match, enforce a minimum; substring/exact are >2 so they pass.
+    if best_key[0] < float(min_ratio):
+        return None
+
+    return best_span
 
 
 def _dict_to_table(d: Dict[int, Dict]) -> pa.Table:
@@ -189,11 +283,19 @@ class _Sources:
 
 class DiorRSVGModulatedDetection(Dataset):
     """
-    DIOR-RSVG Pascal VOC XML.
+    DIOR-RSVG Pascal VOC XML (RefExp-style materialization).
 
-    - caption built by concatenating per-object <description> fields.
-    - each GT box stores (tok_beg, tok_end) char spans into caption.
-    - optionally builds per-sample positive_map if tokenizer is provided.
+    IMPORTANT:
+      - Each <object><description> is treated as a SEPARATE caption.
+      - Therefore, each physical image can appear N times in the dataset:
+            (image, caption_i, box_i)
+
+    For each dataset item:
+      - caption = one object's <description> (or fallback to class name)
+      - annotations = ONLY that object's GT box
+      - tok_beg/tok_end spans cover ONLY the object mention inside the caption
+        (best match vs <name>), fallback to full caption if no match is found
+      - optional positive_map is built if tokenizer is provided
     """
 
     def __init__(
@@ -216,7 +318,7 @@ class DiorRSVGModulatedDetection(Dataset):
         self.idx_to_class: Dict[int, str] = {}
 
         # per-source cache dir (prevents mixing train vs eval caches)
-        ck = _cache_key(self.sources.images_dir, self.sources.annotations_dir)
+        ck = _cache_key(_CACHE_VERSION, self.sources.images_dir, self.sources.annotations_dir)
         self.cache_dir = _CACHE_BASE / ck
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -314,21 +416,27 @@ class DiorRSVGModulatedDetection(Dataset):
             except Exception:
                 continue
 
-            parsed = self._parse_single_xml(xml_bytes, xml_stem=xml_path.stem)
-            if parsed is None:
+            samples = self._parse_single_xml(xml_bytes, xml_stem=xml_path.stem)
+            if not samples:
                 continue
 
-            img_path = images_dir / parsed["filename"]
-            rec = dict(
-                image_id=img_id,
-                image_path=str(img_path),
-                caption=parsed["caption"],
-                filename_stem=Path(parsed["filename"]).stem,
-                orig_size=parsed["orig_size"],
-                annotations=parsed["annotations"],
-            )
-            ann[img_id] = rec
-            img_id += 1
+            for s in samples:
+                img_path = images_dir / s["filename"]
+
+                cap_idx = int(s.get("cap_idx", 0))
+                stem_base = Path(s["filename"]).stem
+                stem = f"{stem_base}_cap{cap_idx:03d}"
+
+                rec = dict(
+                    image_id=img_id,
+                    image_path=str(img_path),
+                    caption=s["caption"],
+                    filename_stem=stem,
+                    orig_size=s["orig_size"],
+                    annotations=s["annotations"],
+                )
+                ann[img_id] = rec
+                img_id += 1
 
         return ann
 
@@ -359,25 +467,35 @@ class DiorRSVGModulatedDetection(Dataset):
                     continue
                 raise
 
-            parsed = self._parse_single_xml(xml_bytes, xml_stem=Path(xml_key).stem)
-            if parsed is None:
+            samples = self._parse_single_xml(xml_bytes, xml_stem=Path(xml_key).stem)
+            if not samples:
                 continue
 
-            img_s3_path = f"s3://{img_bucket}/{img_prefix}{parsed['filename']}"
-            rec = dict(
-                image_id=img_id,
-                image_path=img_s3_path,
-                caption=parsed["caption"],
-                filename_stem=Path(parsed["filename"]).stem,
-                orig_size=parsed["orig_size"],
-                annotations=parsed["annotations"],
-            )
-            ann[img_id] = rec
-            img_id += 1
+            for s in samples:
+                img_s3_path = f"s3://{img_bucket}/{img_prefix}{s['filename']}"
+
+                cap_idx = int(s.get("cap_idx", 0))
+                stem_base = Path(s["filename"]).stem
+                stem = f"{stem_base}_cap{cap_idx:03d}"
+
+                rec = dict(
+                    image_id=img_id,
+                    image_path=img_s3_path,
+                    caption=s["caption"],
+                    filename_stem=stem,
+                    orig_size=s["orig_size"],
+                    annotations=s["annotations"],
+                )
+                ann[img_id] = rec
+                img_id += 1
 
         return ann
 
-    def _parse_single_xml(self, xml_bytes: bytes, xml_stem: str) -> Optional[Dict]:
+    def _parse_single_xml(self, xml_bytes: bytes, xml_stem: str) -> Optional[List[Dict]]:
+        """
+        Return a list of samples, one per <object>:
+          sample = {filename, orig_size=(h,w), caption, annotations=[{bbox,..., tok_beg, tok_end}], cap_idx}
+        """
         try:
             root = ET.fromstring(xml_bytes)
         except ET.ParseError:
@@ -396,9 +514,12 @@ class DiorRSVGModulatedDetection(Dataset):
         else:
             w = h = 0
 
-        caption = ""
-        ann_list: List[Dict] = []
+        # First pass: collect valid per-object samples (caption + single box)
+        tmp_samples: List[Dict] = []
+        max_x = 0.0
+        max_y = 0.0
 
+        cap_idx = 0
         for obj_node in root.findall("object"):
             cls_name = (obj_node.findtext("name") or "unknown").strip() or "unknown"
             if cls_name not in self.class_to_idx:
@@ -410,14 +531,20 @@ class DiorRSVGModulatedDetection(Dataset):
             if not desc:
                 desc = cls_name
 
-            if caption:
-                caption += ". "
-            tok_beg = len(caption)
-            caption += desc
-            tok_end = len(caption)
+            # ONE caption per object (no concatenation)
+            caption = desc
+
+            # IMPORTANT: token span should cover ONLY the object phrase inside the caption
+            span = _find_object_mention_span(caption, cls_name)
+            if span is None:
+                # Fallback (keeps training from silently losing supervision if captions don’t contain the class phrase)
+                tok_beg, tok_end = 0, len(caption)
+            else:
+                tok_beg, tok_end = span
 
             bnd = obj_node.find("bndbox")
             if bnd is None:
+                cap_idx += 1
                 continue
 
             try:
@@ -426,6 +553,7 @@ class DiorRSVGModulatedDetection(Dataset):
                 x2 = float(bnd.findtext("xmax"))
                 y2 = float(bnd.findtext("ymax"))
             except (TypeError, ValueError):
+                cap_idx += 1
                 continue
 
             x0 = min(x1, x2)
@@ -433,38 +561,81 @@ class DiorRSVGModulatedDetection(Dataset):
             x1c = max(x1, x2)
             y1c = max(y1, y2)
 
+            # Clamp to non-negative always
+            x0 = max(0.0, x0)
+            y0 = max(0.0, y0)
+            x1c = max(0.0, x1c)
+            y1c = max(0.0, y1c)
+
+            # If XML size exists, clamp into it
             if w > 0 and h > 0:
-                x0 = max(0.0, min(float(w), x0))
-                y0 = max(0.0, min(float(h), y0))
-                x1c = max(0.0, min(float(w), x1c))
-                y1c = max(0.0, min(float(h), y1c))
+                x0 = min(float(w), x0)
+                y0 = min(float(h), y0)
+                x1c = min(float(w), x1c)
+                y1c = min(float(h), y1c)
 
             if (x1c - x0) < 2 or (y1c - y0) < 2:
+                cap_idx += 1
                 continue
 
+            max_x = max(max_x, x1c)
+            max_y = max(max_y, y1c)
+
             area = float((x1c - x0) * (y1c - y0))
-            ann_list.append(
-                dict(
-                    bbox=[x0, y0, x1c, y1c],
-                    area=area,
-                    category_id=self.class_to_idx[cls_name],
-                    iscrowd=0,
-                    tok_beg=int(tok_beg),
-                    tok_end=int(tok_end),
-                )
+            ann = dict(
+                bbox=[x0, y0, x1c, y1c],
+                area=area,
+                category_id=self.class_to_idx[cls_name],
+                iscrowd=0,
+                tok_beg=int(tok_beg),
+                tok_end=int(tok_end),
             )
 
-        # Keep images even if empty (safe for detection pipelines)
+            tmp_samples.append(
+                dict(
+                    filename=filename,
+                    caption=caption,
+                    annotations=[ann],
+                    cap_idx=int(cap_idx),
+                )
+            )
+            cap_idx += 1
+
+        # Determine orig_size (h,w). If missing in XML, infer from boxes if possible.
         if h <= 0 or w <= 0:
-            if ann_list:
-                ys = [a["bbox"][1] for a in ann_list] + [a["bbox"][3] for a in ann_list]
-                xs = [a["bbox"][0] for a in ann_list] + [a["bbox"][2] for a in ann_list]
-                h = int(max(ys) + 1)
-                w = int(max(xs) + 1)
+            if max_x > 0 and max_y > 0:
+                w = int(max_x + 1)
+                h = int(max_y + 1)
             else:
                 h = w = 0
 
-        return dict(filename=filename, orig_size=(h, w), caption=caption, annotations=ann_list)
+        orig_size = (int(h), int(w))
+
+        # Keep one empty sample if no valid objects (optional safety)
+        if not tmp_samples:
+            return [
+                dict(
+                    filename=filename,
+                    orig_size=orig_size,
+                    caption="",
+                    annotations=[],
+                    cap_idx=0,
+                )
+            ]
+
+        # Attach orig_size to each sample and return
+        out: List[Dict] = []
+        for s in tmp_samples:
+            out.append(
+                dict(
+                    filename=s["filename"],
+                    orig_size=orig_size,
+                    caption=s["caption"],
+                    annotations=s["annotations"],
+                    cap_idx=s["cap_idx"],
+                )
+            )
+        return out
 
 
 # ───────────────────────── transforms ─────────────────────────
@@ -476,9 +647,18 @@ def _dior_rsvg_transforms(split: str):
         ]
     )
     if split == "train":
-        return T.Compose([T.RandomResize([704], max_size=704), normalize])
+        return T.Compose(
+            [
+                T.RandomHorizontalFlip(p=0.50),
+                RandomVerticalFlip(prob=0.50),
+                RandomRotate90(prob=0.25),
+                RandomColorJitter(prob=0.25, brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+                RandomGaussianBlur(prob=0.10, radius=(0.1, 0.6)),
+                RandomGaussianNoise(prob=0.08, std=5.0),
+                normalize,
+            ])
     if split in ("val", "test"):
-        return T.Compose([T.RandomResize([704], max_size=704), normalize])
+        return T.Compose([normalize])
     raise ValueError(split)
 
 
@@ -597,7 +777,12 @@ class _ConvertDiorRSVGToTarget:
             return None
 
         # offsets is either [(s,e), ...] or [[(s,e), ...]]
-        if len(offsets) > 0 and isinstance(offsets[0], (list, tuple)) and len(offsets[0]) == 2 and isinstance(offsets[0][0], int):
+        if (
+            len(offsets) > 0
+            and isinstance(offsets[0], (list, tuple))
+            and len(offsets[0]) == 2
+            and isinstance(offsets[0][0], int)
+        ):
             offs = offsets
         else:
             offs = offsets[0]

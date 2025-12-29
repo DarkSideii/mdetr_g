@@ -147,7 +147,6 @@ def train_one_epoch(
     model: nn.Module,
     criterion: Optional[nn.Module],
     contrastive_criterion: Optional[nn.Module],
-    qa_criterion: Optional[nn.Module],
     data_loader: Iterable,
     weight_dict: Dict[str, float],
     optimizer: torch.optim.Optimizer,
@@ -162,8 +161,6 @@ def train_one_epoch(
         criterion.train()
     if isinstance(contrastive_criterion, nn.Module):
         contrastive_criterion.train()
-    if isinstance(qa_criterion, nn.Module):
-        qa_criterion.train()
 
     logger = MetricLogger(delimiter=" ")
     logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -216,12 +213,8 @@ def train_one_epoch(
                 # still try with tokens_positive if pos_map absent
                 _report_alignment_issues("TRAIN", f"e{epoch}/u{update_idx}", raw_targets, None)
 
-            if args.masks:
-                outputs = model(samples, captions)
-                memory_cache = None
-            else:
-                memory_cache = model(samples, captions, encode_and_save=True)
-                outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
+            memory_cache = model(samples, captions, encode_and_save=True)
+            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
 
             loss_dict: Dict[str, torch.Tensor] = {}
 
@@ -350,12 +343,8 @@ def evaluate(
 
         targets = targets_to(targets, device)
 
-        memory_cache = None
-        if args.masks:
-            outputs = model(samples, captions)
-        else:
-            memory_cache = model(samples, captions, encode_and_save=True)
-            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
+        memory_cache = model(samples, captions, encode_and_save=True)
+        outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
 
         loss_dict: Dict[str, torch.Tensor] = {}
         if criterion is not None:

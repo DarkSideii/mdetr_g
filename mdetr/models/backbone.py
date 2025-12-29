@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Backbone builders for mdetr_g
-- Satlas Aerial Swin
-- torchvision ResNet (FrozenBN / GroupNorm)
-- timm (e.g., ConvNeXt) in features_only mode
-"""
-
 from collections import OrderedDict
 
 import torch
@@ -300,13 +291,15 @@ def _normalize_backbone_name(name: str) -> str:
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = getattr(args, "lr_backbone", 0.0) > 0.0
+
+    # NOTE: no segmentation => no args.masks. We only return multiple levels when needed
+    # for deformable multi-scale (k>1).
     ttype = getattr(args, "transformer_type", "deformable").lower()
     if ttype == "vanilla":
         k = 1
-        return_interm_layers = bool(args.masks)
     else:
-        k = getattr(args, "num_feature_levels", 1)
-        return_interm_layers = (k > 1) or args.masks
+        k = int(getattr(args, "num_feature_levels", 1))
+    return_interm_layers = (k > 1)
 
     backbone = None
 

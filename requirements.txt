@@ -1,7 +1,19 @@
+# =========================
+# DGX Spark (CUDA 13.0) + Py3.11
+# =========================
+#
+# PyTorch: install from the cu130 index:
+#   pip install --index-url https://download.pytorch.org/whl/cu130 \
+#     torch==2.9.1+cu130 torchvision==0.24.1 torchaudio==2.9.1
+#
+# MMCV: built from source with CUDA ops (editable) in ./mmcv
+#   DO NOT install mmcv from pip here, or you may overwrite the built ops.
+
 # --- Core numerical / DL ---
 numpy==2.2.6
-torch==2.4.1
-torchvision==0.19.1
+torch==2.9.1+cu130
+torchvision==0.24.1
+torchaudio==2.9.1
 
 # --- Transformers (text encoder) ---
 transformers==4.46.3
@@ -13,15 +25,13 @@ datasets==3.6.0
 timm==1.0.19
 satlaspretrain-models==0.3.1
 
-# --- Deformable attention (MMCV op) ---
-mmcv==2.2.0
+# --- MMCV ecosystem ---
 mmengine==0.10.7
-# (Install a CUDA-matching wheel for mmcv; openmim is optional and not required at runtime.)
+# mmcv==2.2.0  # installed from local source with CUDA ops in ./mmcv
 
 # --- Data / storage / cache ---
 boto3==1.34.162
 pyarrow==21.0.0
-rasterio==1.4.3
 affine==2.4.0
 tqdm==4.66.5
 Pillow==11.2.1

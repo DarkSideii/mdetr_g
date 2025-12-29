@@ -42,132 +42,97 @@ def get_args_parser():
     p = argparse.ArgumentParser("mdetr_g detector", add_help=False)
 
     # 1) bookkeeping
-    p.add_argument("--run_name", default="", type=str)
-    p.add_argument("--seed", default=42, type=int)
-    p.add_argument("--no_detection", action="store_true", help="Whether to train the detector")
+    p.add_argument("--run_name",                  default="", type=str)
+    p.add_argument("--seed",                      default=42, type=int)
+    p.add_argument("--no_detection",              action="store_true", help="Whether to train the detector")
 
     # 2) dataset & splits
-    p.add_argument("--dataset_config", default=None, nargs="?", const=None, help="JSON with S3 paths / extra flags")
-    p.add_argument("--val_split_ratio", default=0.2, type=float, help="Fraction of training set held out for validation")
+    p.add_argument("--dataset_config",            default=None, nargs="?", const=None, help="JSON with S3 paths / extra flags")
+    p.add_argument("--val_split_ratio",           default=0.2, type=float, help="Fraction of training set held out for validation")
 
     # 3) optimisation & schedule
-    p.add_argument("--batch_size", default=2, type=int)
-    p.add_argument("--epochs", default=40, type=int)
-    p.add_argument("--lr", default=1e-4, type=float)
-    p.add_argument("--lr_backbone", default=1e-5, type=float)
-    p.add_argument("--text_encoder_lr", default=5e-5, type=float)
-    p.add_argument("--weight_decay", default=1e-4, type=float)
-    p.add_argument("--optimizer", default="adam", type=str)
-    p.add_argument("--clip_max_norm", default=0.1, type=float)
-    p.add_argument(
-        "--schedule",
-        default="linear_with_warmup",
-        choices=("step", "multistep", "linear_with_warmup", "all_linear_with_warmup", "all_cosine_with_warmup"),
-    )
-    p.add_argument("--lr_drop", default=35, type=int, help="Epoch milestone for *step* or *multistep* sched")
-    p.add_argument("--fraction_warmup_steps", default=0.01, type=float)
-    p.add_argument("--ema", action="store_true")
-    p.add_argument("--ema_decay", default=0.9998, type=float)
-    p.add_argument("--eval_skip", default=1, type=int, help="Validate every N epochs")
+    p.add_argument("--batch_size",                default=2, type=int)
+    p.add_argument("--epochs",                    default=40, type=int)
+    p.add_argument("--lr",                        default=1e-4, type=float)
+    p.add_argument("--lr_backbone",               default=1e-5, type=float)
+    p.add_argument("--text_encoder_lr",           default=5e-5, type=float)
+    p.add_argument("--weight_decay",              default=1e-4, type=float)
+    p.add_argument("--optimizer",                 default="adam", type=str)
+    p.add_argument("--clip_max_norm",             default=0.1, type=float)
+    p.add_argument("--schedule",                  default="linear_with_warmup", choices=("step", "multistep", "linear_with_warmup", "all_linear_with_warmup", "all_cosine_with_warmup"))
+    p.add_argument("--lr_drop",                   default=35, type=int, help="Epoch milestone for *step* or *multistep* sched")
+    p.add_argument("--fraction_warmup_steps",     default=0.01, type=float)
+    p.add_argument("--ema",                       action="store_true")
+    p.add_argument("--ema_decay",                 default=0.9998, type=float)
+    p.add_argument("--eval_skip",                 default=1, type=int, help="Validate every N epochs")
 
     # 4) model-level knobs
-    p.add_argument("--frozen_weights", default=None, type=str)
-    p.add_argument("--freeze_text_encoder", action="store_true")
-    p.add_argument(
-        "--text_encoder_type",
-        default="sentence-transformers/all-MiniLM-L6-v2",
-        type=str,
-        help="HF model name for text encoder (e.g. roberta-base, sentence-transformers/all-MiniLM-L6-v2)",
-    )
-    p.add_argument(
-        "--backbone",
-        default="ConvNeXt",
-        type=str,
-        help="Backbone CNN, e.g. ConvNeXt, convnext_tiny/small/base/large, or timm_<name>",
-    )
-    p.add_argument("--dilation", action="store_true")
-    p.add_argument("--position_embedding", default="sine", choices=("sine", "learned"))
-    p.add_argument("--masks", action="store_true", help="Enable segmentation heads/losses if present")
+    p.add_argument("--frozen_weights",            default=None, type=str)
+    p.add_argument("--freeze_text_encoder",       action="store_true")
+    p.add_argument("--text_encoder_type",         default="sentence-transformers/all-MiniLM-L6-v2", type=str, help="HF model name for text encoder (e.g. roberta-base, sentence-transformers/all-MiniLM-L6-v2)")
+    p.add_argument("--backbone",                  default="ConvNeXt", type=str, help="Backbone CNN, e.g. ConvNeXt, convnext_tiny/small/base/large, or timm_<name>")
+    p.add_argument("--dilation",                  action="store_true")
+    p.add_argument("--position_embedding",        default="sine", choices=("sine", "learned"))
 
     # 5) transformer
-    p.add_argument("--enc_layers", default=6, type=int)
-    p.add_argument("--dec_layers", default=6, type=int)
-    p.add_argument("--dim_feedforward", default=2048, type=int)
-    p.add_argument("--hidden_dim", default=256, type=int)
-    p.add_argument("--dropout", default=0.1, type=float)
-    p.add_argument("--nheads", default=8, type=int)
-    p.add_argument("--num_queries", default=100, type=int)
-    p.add_argument("--pre_norm", action="store_true")
-    p.add_argument("--no_pass_pos_and_query", dest="pass_pos_and_query", action="store_false")
+    p.add_argument("--enc_layers",                default=6, type=int)
+    p.add_argument("--dec_layers",                default=6, type=int)
+    p.add_argument("--dim_feedforward",           default=2048, type=int)
+    p.add_argument("--hidden_dim",                default=256, type=int)
+    p.add_argument("--dropout",                   default=0.1, type=float)
+    p.add_argument("--nheads",                    default=8, type=int)
+    p.add_argument("--num_queries",               default=100, type=int)
+    p.add_argument("--pre_norm",                  action="store_true")
+    p.add_argument("--no_pass_pos_and_query",     dest="pass_pos_and_query", action="store_false")
 
     # Deformable attention (multi-scale always inferred from num_feature_levels)
-    p.add_argument("--num_feature_levels", type=int, default=3, help="How many backbone stages to use (1-4). Typically 3 (last 3 stages).")
-    p.add_argument("--deform_num_points", type=int, default=4, help="Sampling points per head per level (4 or 8 are common)")
+    p.add_argument("--num_feature_levels",        type=int, default=3, help="How many backbone stages to use (1-4). Typically 3 (last 3 stages).")
+    p.add_argument("--deform_num_points",         type=int, default=4, help="Sampling points per head per level (4 or 8 are common)")
 
     # 6) losses
-    p.add_argument("--set_cost_class", default=1, type=float)
-    p.add_argument("--set_cost_bbox", default=5, type=float)
-    p.add_argument("--set_cost_giou", default=2, type=float)
-    p.add_argument("--no_aux_loss", dest="aux_loss", action="store_false")
-    p.add_argument("--set_loss", default="hungarian", choices=("sequential", "hungarian", "lexicographical"))
-    p.add_argument("--ce_loss_coef", default=1.0, type=float)
-    p.add_argument("--bbox_loss_coef", default=5.0, type=float)
-    p.add_argument("--giou_loss_coef", default=2.0, type=float)
-    p.add_argument("--qa_loss_coef", default=1.0, type=float)
-    p.add_argument("--eos_coef", default=0.1, type=float)
+    p.add_argument("--set_cost_class",            default=1, type=float)
+    p.add_argument("--set_cost_bbox",             default=5, type=float)
+    p.add_argument("--set_cost_giou",             default=2, type=float)
+    p.add_argument("--no_aux_loss",               dest="aux_loss", action="store_false")
+    p.add_argument("--set_loss",                  default="hungarian", choices=("sequential", "hungarian", "lexicographical"))
+    p.add_argument("--ce_loss_coef",              default=1.0, type=float)
+    p.add_argument("--bbox_loss_coef",            default=5.0, type=float)
+    p.add_argument("--giou_loss_coef",            default=2.0, type=float)
+    p.add_argument("--eos_coef",                  default=0.1, type=float)
 
     # contrastive defaults
     p.set_defaults(contrastive_loss=True, contrastive_align_loss=True)
-    p.add_argument("--no_contrastive_loss", dest="contrastive_loss", action="store_false")
+    p.add_argument("--no_contrastive_loss",       dest="contrastive_loss", action="store_false")
     p.add_argument("--no_contrastive_align_loss", dest="contrastive_align_loss", action="store_false")
-    p.add_argument("--contrastive_loss_hdim", default=64, type=int)
-    p.add_argument("--temperature_NCE", default=0.07, type=float)
-    p.add_argument("--contrastive_loss_coef", default=0.1, type=float)
+    p.add_argument("--contrastive_loss_hdim",     default=64, type=int)
+    p.add_argument("--temperature_NCE",           default=0.07, type=float)
+    p.add_argument("--contrastive_loss_coef",     default=0.1, type=float)
     p.add_argument("--contrastive_align_loss_coef", default=1.0, type=float)
-    p.add_argument("--logit_scale_lr", default=5e-6, type=float, help="LR for learnable logit scales (cls/align). Use a small value.")
+    p.add_argument("--logit_scale_lr",            default=5e-6, type=float, help="LR for learnable logit scales (cls/align). Use a small value.")
 
     # 7) runtime / I-O
-    p.add_argument("--output_dir", default="", type=str)
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--resume", default=None, help="resume from ckpt")
-    p.add_argument("--load", default=None, help="load weights only")
-    p.add_argument("--start-epoch", default=0, type=int)
-    p.add_argument("--eval", action="store_true")
-    p.add_argument("--test", action="store_true")
-    p.add_argument("--test_type", default="test", choices=("test", "testA", "testB"))
-    p.add_argument("--grad_accum_steps", default=1, type=int, help="Accumulate gradients over N micro-batches before optimizer.step()")
+    p.add_argument("--output_dir",                default="", type=str)
+    p.add_argument("--device",                    default="cuda")
+    p.add_argument("--resume",                    default=None, help="resume from ckpt")
+    p.add_argument("--load",                      default=None, help="load weights only")
+    p.add_argument("--start-epoch",               default=0, type=int)
+    p.add_argument("--eval",                      action="store_true")
+    p.add_argument("--test",                      action="store_true")
+    p.add_argument("--test_type",                 default="test", choices=("test", "testA", "testB"))
+    p.add_argument("--grad_accum_steps",          default=1, type=int, help="Accumulate gradients over N micro-batches before optimizer.step()")
 
     group = p.add_mutually_exclusive_group()
-    group.add_argument("--use_text_cross_attn", dest="use_text_cross_attn", action="store_true", help="Enable decoder cross-attention to text tokens")
-    group.add_argument("--no_text_cross_attn", dest="use_text_cross_attn", action="store_false", help="Disable decoder cross-attention to text tokens")
+    group.add_argument("--use_text_cross_attn",   dest="use_text_cross_attn", action="store_true", help="Enable decoder cross-attention to text tokens")
+    group.add_argument("--no_text_cross_attn",    dest="use_text_cross_attn", action="store_false", help="Disable decoder cross-attention to text tokens")
     p.set_defaults(use_text_cross_attn=True)
 
-    p.add_argument(
-        "--dataset_file",
-        default="dior_rsvg",
-        choices=("dior_rsvg",),
-        help="Which dataset to use (fresh start: DIOR-RSVG).",
-    )
+    p.add_argument("--dataset_file",              default="dior_rsvg", choices=("dior_rsvg",), help="Which dataset to use (fresh start: DIOR-RSVG).")
 
-    p.add_argument(
-        "--transformer_type",
-        default="deformable",
-        choices=("deformable", "vanilla"),
-        help="deformable = MSDeformAttn (MMCV); vanilla = standard MultiheadAttention (no deformable attn).",
-    )
-    p.add_argument(
-        "--no_deformable_attn",
-        action="store_true",
-        help="Alias for --transformer_type vanilla",
-    )
-    p.add_argument(
-        "--align_scale_mode",
-        default="learnable",
-        choices=("learnable", "hardcoded"),
-        help="Ablation: learnable uses model logit_scale_align, hardcoded uses 1/temperature_NCE.",
-    )
+    p.add_argument("--transformer_type",          default="deformable", choices=("deformable", "vanilla"), help="deformable = MSDeformAttn (MMCV); vanilla = standard MultiheadAttention (no deformable attn).")
+    p.add_argument("--no_deformable_attn",        action="store_true", help="Alias for --transformer_type vanilla")
+    p.add_argument("--align_scale_mode",          default="learnable", choices=("learnable", "hardcoded"), help="Ablation: learnable uses model logit_scale_align, hardcoded uses 1/temperature_NCE.")
+    p.add_argument("--cls_scale_mode",            default="learnable", choices=("learnable", "off"), help="Ablation: learnable multiplies pred_logits by exp(logit_scale_cls); off disables cls scaling (original MDETR-style).")
     return p
-
 
 def count_params_model(model):
     total = 0
@@ -343,7 +308,7 @@ def main(args):
             out_dir.mkdir(parents=True, exist_ok=True)
 
         # ---------------- model ----------------
-        model, criterion, contrastive_criterion, qa_criterion, weight_dict = build_model(args)
+        model, criterion, contrastive_criterion, weight_dict = build_model(args)
         model.to(device)
         args.tokenizer = model.tokenizer  # expose to dataset builder
 
@@ -558,7 +523,6 @@ def main(args):
                 model,
                 criterion,
                 contrastive_criterion,
-                qa_criterion,
                 dl_train,
                 weight_dict,
                 optimizer,
