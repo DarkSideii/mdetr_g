@@ -5,13 +5,11 @@ import io
 import json
 import random
 import re
-import hashlib
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import boto3
 import pyarrow as pa
@@ -26,7 +24,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-import mdetr.datasets.transforms as T
+import multimodal_framework.mdetr.datasets.transforms as T
 from util.augs import (
     RandomColorJitter,
     RandomGaussianBlur,
@@ -38,7 +36,6 @@ from util.augs import (
 load_dotenv()
 random.seed(42)
 _openai = OpenAI()
-
 _S3_CFG = Config(
     retries={"max_attempts": 10, "mode": "adaptive"},
     connect_timeout=10,
@@ -48,27 +45,31 @@ _S3_CFG = Config(
 # ─────────────────────────────── cache paths ────────────────────────────────
 _THIS_DIR = Path(__file__).resolve().parent
 _PARENT_DIR = _THIS_DIR.parent
-_CACHE_BASE = _PARENT_DIR / "dota_cache"
-_CACHE_BASE.mkdir(parents=True, exist_ok=True)
+_CACHE_DIR = _PARENT_DIR / "dota_cache"
+_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Bump this if you change materialization format (prevents stale cache reuse)
-_CACHE_VERSION = "dota_configured_s3_v1"
+ARROW_CACHE = _CACHE_DIR / "dota_annotations.parquet"
+CLASSES_JSON = _CACHE_DIR / "dota_classes.json"
 
 # ─────────────────────────────── DOTA settings ────────────────────────────────
+# Classes per your requirement
 CLASS_NAMES = ["ship", "plane"]
 CLASS_TO_IDX = {name: i + 1 for i, name in enumerate(CLASS_NAMES)}  # contiguous [1..K]
 IDX_TO_CLASS = {v: k for k, v in CLASS_TO_IDX.items()}
 
+# Caption alignment keywords
 CAPTION_KEYS = {
     "ship": ["ship", "ships"],
     "plane": ["plane", "planes"],
 }
 
+# RP-style split helper
 _SPLIT_RE = re.compile(r"\d+\.\s*")
 def _split(txt: str) -> list[str]:
     return [p.strip() for p in _SPLIT_RE.split(txt or "") if p.strip()]
 
 # ───────────────────────── caption augmentation prompt ──────────────────────
+# Keep BLANK exactly as requested.
 _CAP_PROMPT = (
     "Generate NEW sentences that lightly paraphrase the Existing text.\n"
     "\n"
@@ -83,9 +84,14 @@ _CAP_PROMPT = (
     "8) Output EXACTLY the lines, with NO numbering, bullets, dashes, or extra headers—just the sentences on separate lines.\n"
 )
 
+def _split_sents(txt: str) -> List[str]:
+    parts = re.split(r"\d+\.\s*", txt or "")
+    return [p.strip() for p in parts if p.strip()]
+
 def _call_gpt(existing: List[str], need: int) -> List[str]:
     if need <= 0:
         return []
+    # RP-style: only a single user message
     prefix = (_CAP_PROMPT + "\n\n") if _CAP_PROMPT else ""
     user_msg = prefix + "Here are the existing sentences:\n" + "\n".join(f"- {s}" for s in existing)
 
@@ -95,6 +101,7 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
         temperature=0.1,
     )
     raw = resp.choices[0].message.content
+    # Strip numbering/bullets that models sometimes add
     lines = [
         re.compile(r"^\s*(?:\d+\s*[.)-]?\s*|[-\u2013\u2014*\u2022]+\s+)").sub("", l).strip()
         for l in raw.split("\n")
@@ -102,90 +109,9 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
     ]
     return lines[:need]
 
-# ───────────────────── S3 helpers (config-driven) ─────────────────────
-def _is_s3(uri: str) -> bool:
-    return str(uri).startswith("s3://")
-
-def _split_s3_prefix_uri(uri: str) -> Tuple[str, str]:
-    """
-    Parse an S3 *prefix* URI: s3://bucket/optional/prefix
-    Returns (bucket, prefix_with_trailing_slash_or_empty).
-    """
-    if not uri.startswith("s3://"):
-        raise ValueError(f"Not an s3 uri: {uri}")
-    rest = uri[5:]
-    if "/" in rest:
-        bucket, prefix = rest.split("/", 1)
-    else:
-        bucket, prefix = rest, ""
-    if prefix and not prefix.endswith("/"):
-        prefix += "/"
-    return bucket, prefix
-
-def _split_s3_object_uri(uri: str) -> Tuple[str, str]:
-    """Parse s3://bucket/key and return (bucket, key)."""
-    if not uri.startswith("s3://"):
-        raise ValueError(f"Not an s3 object uri: {uri}")
-    rest = uri[5:]
-    bucket, key = rest.split("/", 1)
-    return bucket, key
-
-def _cache_key(*parts: str) -> str:
-    h = hashlib.sha1()
-    for p in parts:
-        h.update(str(p).encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()[:16]
-
-def _try_get_s3_bytes(s3, uri: str) -> Optional[bytes]:
-    """Return bytes for s3://... or None if NoSuchKey/404."""
-    b, k = _split_s3_object_uri(uri)
-    try:
-        return s3.get_object(Bucket=b, Key=k)["Body"].read()
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("NoSuchKey", "404"):
-            return None
-        raise
-
-def _resolve_image_uri(images_dir: str, img_field: str, stem: str) -> List[str]:
-    """
-    Build a list of candidate s3:// URIs for the image:
-      1) If CSV Image field is already s3:// -> use it
-      2) Else join CSV Image field under images_dir
-      3) Fallback: try stem + common extensions under images_dir
-    """
-    cand: List[str] = []
-
-    img_bucket, img_prefix = _split_s3_prefix_uri(images_dir)
-
-    if img_field:
-        img_field = str(img_field).strip()
-        if _is_s3(img_field):
-            cand.append(img_field)
-        else:
-            rel = img_field.lstrip("/")
-            # if rel is already a full key (rare), respect it if it begins with prefix
-            if img_prefix and rel.startswith(img_prefix):
-                cand.append(f"s3://{img_bucket}/{rel}")
-            else:
-                cand.append(f"s3://{img_bucket}/{img_prefix}{rel}")
-
-    for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
-        cand.append(f"s3://{img_bucket}/{img_prefix}{stem}{ext}")
-
-    # de-dup while preserving order
-    out = []
-    seen = set()
-    for u in cand:
-        if u not in seen:
-            out.append(u)
-            seen.add(u)
-    return out
-
 # ───────────────────── positive map (token alignment) helpers ─────────────────────
 def create_positive_map(tokenized, tokens_positive):
-    """Construct positive_map[i,j] = 1 iff box i is associated to token j (row-normalized)."""
+    """Construct a map such that positive_map[i,j] = True iff box i is associated to token j."""
     positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
     for j, tok_list in enumerate(tokens_positive):
         for (beg, end) in tok_list:
@@ -216,7 +142,10 @@ def create_positive_map(tokenized, tokens_positive):
     return positive_map / (positive_map.sum(-1)[:, None] + 1e-6)
 
 def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int, str]]:
-    """Case-insensitive char-span finder for any candidate string."""
+    """
+    Case-insensitive char-span finder for any of the candidate strings.
+    Returns (start, end, matched_text) or None.
+    """
     if not caption:
         return None
     lower = caption.lower()
@@ -295,76 +224,95 @@ def _build_coco_like(ann_dict: Dict[int, Dict]) -> Dict:
                 )
             )
             aid += 1
+
     cats = [{"id": cid, "name": IDX_TO_CLASS[cid]} for cid in sorted(IDX_TO_CLASS)]
     return {"images": imgs, "annotations": anns, "categories": cats, "info": {}, "licenses": []}
 
 # ─────────────────────────────── Dataset ────────────────────────────────
 @dataclass
-class _Sources:
-    # These come from your JSON config (train_* or eval_*)
-    images_dir: str         # s3://bucket/prefix/to/images/
-    annotations_dir: str    # s3://bucket/prefix/to/labels/ (TXT files)
-    csv_path: str           # s3://bucket/key/to/captions.csv
+class _S3Sources:
+    bucket: str = "research-geodatasets"
+    images_prefix: str = "DOTAv2/images/"
+    labels_prefix: str = "DOTAv2/labels/"
+    csv_key: str = "DOTAv2/dota_sentencesv2.csv"
+
+def _get_arg_str(args, key: str, default: str) -> str:
+    v = getattr(args, key, None)
+    if v is None:
+        return str(default)
+    if isinstance(v, str) and not v.strip():
+        return str(default)
+    return str(v)
+
+def _get_arg_float(args, key: str, default: float) -> float:
+    v = getattr(args, key, None)
+    if v is None:
+        return float(default)
+    return float(v)
+
+def _get_arg_int(args, key: str, default: int) -> int:
+    v = getattr(args, key, None)
+    if v is None:
+        return int(default)
+    return int(v)
+
+def _sources_from_args(args) -> _S3Sources:
+    """
+    ONLY uses the existing hardcoded knobs:
+      - bucket
+      - images_prefix
+      - labels_prefix
+      - csv_key
+    """
+    defaults = _S3Sources()
+    return _S3Sources(
+        bucket=_get_arg_str(args, "bucket", defaults.bucket),
+        images_prefix=_get_arg_str(args, "images_prefix", defaults.images_prefix),
+        labels_prefix=_get_arg_str(args, "labels_prefix", defaults.labels_prefix),
+        csv_key=_get_arg_str(args, "csv_key", defaults.csv_key),
+    )
 
 class DotaModulatedDetection(Dataset):
     """
-    TXT HBB labels formatted like: `ship 68 305 86 335`.
-    Config-driven S3 locations:
-      - images_dir (prefix)
-      - annotations_dir (prefix)
-      - csv_path (object)
+    DOTA v2 with TXT HBB labels formatted like: `ship 68 305 86 335`.
+    Pipeline matches RP: splits, augs, GPT top-up, COCO mirror, positive map, etc.
     """
     def __init__(
         self,
         tokenizer=None,
         return_tokens: bool = False,
         augment_train: bool = False,
-        sources: _Sources = None,
+        sources: _S3Sources = _S3Sources(),
         val_split_ratio: float = 0.2,
         seed: int = 42,
-        eval_mode: bool = False,
     ):
         super().__init__()
-        if sources is None:
-            raise ValueError("DotaModulatedDetection: sources must be provided (images_dir/annotations_dir/csv_path).")
-
         self._s3 = None
         self.sources = sources
-        self.seed = int(seed)
-        self.eval_mode = bool(eval_mode)
+        self.seed = seed
         self.prepare = _ConvertDotaToTarget(tokenizer, return_tokens)
 
-        # per-source cache (prevents train/eval collisions)
-        ck = _cache_key(_CACHE_VERSION, self.sources.images_dir, self.sources.annotations_dir, self.sources.csv_path)
-        self.cache_dir = _CACHE_BASE / ck
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.arrow_cache = self.cache_dir / "annotations.parquet"
-        self.classes_json = self.cache_dir / "classes.json"
-
-        cache_found = self.arrow_cache.exists() and self.classes_json.exists()
+        cache_found = ARROW_CACHE.exists() and CLASSES_JSON.exists()
         if cache_found:
-            ann_raw = _table_to_dict(pq.read_table(self.arrow_cache))
+            ann_raw = _table_to_dict(pq.read_table(ARROW_CACHE))
         else:
             ann_raw = self._build_annotations()
 
+        self.annotations = ann_raw
         self.ids_all = list(ann_raw)
+        self.ids = self.ids_all  # <- safety default; build_dota() will override
 
-        # Split only in train mode
-        if self.eval_mode:
-            self.ids_train, self.ids_val = self.ids_all, self.ids_all
-        else:
-            self.ids_train, self.ids_val = self._split_groups(ann_raw, float(val_split_ratio))
-            if not self.ids_val:
-                n = max(1, int(len(self.ids_all) * float(val_split_ratio)))
-                self.ids_val, self.ids_train = self.ids_all[:n], self.ids_all[n:]
+        self.ids_train, self.ids_val = self._split_groups(ann_raw, val_split_ratio)
+        if not self.ids_val:
+            n = max(1, int(len(self.ids_all) * val_split_ratio))
+            self.ids_val, self.ids_train = self.ids_all[:n], self.ids_all[n:]
 
-        # Augmentation/explode only when building fresh cache AND not eval mode
-        if (not cache_found) and (not self.eval_mode):
+        if not cache_found:
             # 1) VAL: explode to 1 sample per caption (NO GPT)
             new_val_ids = self._explode_captions_no_gpt(ann_raw, only_ids=set(self.ids_val))
             self.ids_val = list(self.ids_val) + new_val_ids
 
-            # 2) TRAIN: GPT top-up
+            # 2) TRAIN: RP behavior (split + GPT top-up)
             if augment_train:
                 before = set(ann_raw.keys())
                 self._augment_captions_once(ann_raw, only_ids=set(self.ids_train))
@@ -372,31 +320,22 @@ class DotaModulatedDetection(Dataset):
                 new_train_ids = sorted(after - before)
                 self.ids_train = list(self.ids_train) + new_train_ids
 
-        # write cache after augmentation, so it's persisted
         if not cache_found:
-            pq.write_table(_dict_to_table(ann_raw), self.arrow_cache, compression="zstd")
-            self.classes_json.write_text(json.dumps(CLASS_TO_IDX))
-
-        self.annotations = ann_raw
+            pq.write_table(_dict_to_table(ann_raw), ARROW_CACHE, compression="zstd")
+            CLASSES_JSON.write_text(json.dumps(CLASS_TO_IDX))
 
         self.coco = COCO()
         self.coco.dataset = _build_coco_like(self.annotations)
         self.coco.createIndex()
 
-    # ────────────── Dataset plumbing ───────────────
     def __len__(self):
         return len(self.ids)
 
     def __getitem__(self, idx):
         rec = self.annotations[self.ids[idx]]
-        img_path = rec["image_path"]
-
-        if not _is_s3(img_path):
-            raise ValueError(f"Expected s3:// image_path, got {img_path!r}")
-
-        bucket, key = _split_s3_object_uri(img_path)
+        key = rec["image_path"].removeprefix(f"s3://{self.sources.bucket}/")
         s3 = self._get_s3()
-        img_bin = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        img_bin = s3.get_object(Bucket=self.sources.bucket, Key=key)["Body"].read()
         img = Image.open(io.BytesIO(img_bin)).convert("RGB")
 
         if rec["orig_size"] == (0, 0):
@@ -414,70 +353,49 @@ class DotaModulatedDetection(Dataset):
             self._s3 = boto3.client("s3", config=_S3_CFG)
         return self._s3
 
-    # ────────────── Annotation builder ─────────────
     def _build_annotations(self) -> Dict[int, Dict]:
         """
         Scan S3 once, parse TXT HBB -> xyxy bboxes.
-        Use CSV to map stem -> caption and/or image path.
+        Use the CSV to tie each <stem> to its S3 image path and caption.
         """
-        if not _is_s3(self.sources.csv_path):
-            raise ValueError(f"csv_path must be s3://..., got {self.sources.csv_path!r}")
-        if not _is_s3(self.sources.annotations_dir):
-            raise ValueError(f"annotations_dir must be s3://..., got {self.sources.annotations_dir!r}")
-        if not _is_s3(self.sources.images_dir):
-            raise ValueError(f"images_dir must be s3://..., got {self.sources.images_dir!r}")
-
         s3 = boto3.client("s3", config=_S3_CFG)
 
-        # 1) Load captions CSV
-        csv_bucket, csv_key = _split_s3_object_uri(self.sources.csv_path)
         csv_rows = list(
             csv.DictReader(
-                s3.get_object(Bucket=csv_bucket, Key=csv_key)["Body"]
+                s3.get_object(Bucket=self.sources.bucket, Key=self.sources.csv_key)["Body"]
                 .read()
                 .decode()
                 .splitlines()
             )
         )
-        info_by_stem = {Path(r["Image"]).stem: r for r in csv_rows if r.get("Image")}
+        info_by_stem = {Path(r["Image"]).stem: r for r in csv_rows}
 
-        # 2) List all TXT label files under annotations_dir
-        ann_bucket, ann_prefix = _split_s3_prefix_uri(self.sources.annotations_dir)
         paginator = s3.get_paginator("list_objects_v2")
         txt_objs = [
             obj
-            for page in paginator.paginate(Bucket=ann_bucket, Prefix=ann_prefix)
+            for page in paginator.paginate(Bucket=self.sources.bucket, Prefix=self.sources.labels_prefix)
             for obj in page.get("Contents", [])
             if obj["Key"].endswith(".txt")
         ]
 
-        ann: Dict[int, Dict] = {}
-        img_id = 0
-
+        ann, img_id = {}, 0
         for obj in tqdm(txt_objs, desc="Parsing DOTA TXT", unit="file"):
-            label_key = obj["Key"]
-            stem = Path(label_key).stem
+            stem = Path(obj["Key"]).stem
             if stem not in info_by_stem:
                 continue
 
-            row = info_by_stem[stem]
-            caption_text = row.get("Description", "") or ""
-            img_field = row.get("Image", "") or ""
+            img_s3_path = info_by_stem[stem]["Image"]
+            caption_text = info_by_stem[stem].get("Description", "") or ""
 
-            # Read image to get dims (try CSV path, then fallbacks under images_dir)
-            img_candidates = _resolve_image_uri(self.sources.images_dir, img_field, stem)
-
-            img_bin = None
-            img_s3_path = None
-            for cand_uri in img_candidates:
-                b = _try_get_s3_bytes(s3, cand_uri)
-                if b is not None:
-                    img_bin = b
-                    img_s3_path = cand_uri
-                    break
-            if img_bin is None or img_s3_path is None:
-                # skip if we can't fetch the image
-                continue
+            key_img = img_s3_path.removeprefix(f"s3://{self.sources.bucket}/")
+            try:
+                img_bin = s3.get_object(Bucket=self.sources.bucket, Key=key_img)["Body"].read()
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "NoSuchKey":
+                    raise
+                fallback_key = f"{self.sources.images_prefix}{stem}.png"
+                img_bin = s3.get_object(Bucket=self.sources.bucket, Key=fallback_key)["Body"].read()
+                img_s3_path = f"s3://{self.sources.bucket}/{fallback_key}"
 
             with Image.open(io.BytesIO(img_bin)) as im:
                 W, H = im.size
@@ -491,7 +409,11 @@ class DotaModulatedDetection(Dataset):
                 annotations=[],
             )
 
-            raw_txt = s3.get_object(Bucket=ann_bucket, Key=label_key)["Body"].read().decode()
+            raw_txt = (
+                s3.get_object(Bucket=self.sources.bucket, Key=obj["Key"])["Body"]
+                .read()
+                .decode()
+            )
 
             for ln in raw_txt.splitlines():
                 line = ln.strip()
@@ -533,7 +455,6 @@ class DotaModulatedDetection(Dataset):
 
         return ann
 
-    # ───────────── caption splitting / augmentation (RP behavior) ─────────────
     def _explode_captions_no_gpt(self, ann: Dict[int, Dict], only_ids=None) -> list[int]:
         if not ann:
             return []
@@ -613,7 +534,6 @@ class DotaModulatedDetection(Dataset):
                 ann[nxt] = dup
                 nxt += 1
 
-    # ───────────── util helpers ─────────────
     def _split_groups(self, ann_dict, val_ratio):
         ids = list(ann_dict)
         stems = [ann_dict[i]["filename_stem"] for i in ids]
@@ -645,7 +565,7 @@ def _dota_transforms(split: str):
                 normalize,
             ]
         )
-    elif split in ("val", "test"):
+    elif split == "val":
         return T.Compose([T.RandomResize([704], max_size=704), normalize])
     else:
         raise ValueError(split)
@@ -662,59 +582,27 @@ class _WrappedDataset(torch.utils.data.Dataset):
         img, tgt = self.tfm(img, tgt)
         return img, tgt
 
-# ───────────────────── dataset builder (matches your config style) ─────────────────────
-def _require(args, key: str) -> str:
-    v = getattr(args, key, None)
-    if v is None or (isinstance(v, str) and not v.strip()):
-        raise ValueError(f"Missing required config key: {key}")
-    return str(v)
-
+# ───────────────────── dataset builders ─────────────────────
 def build_dota(set_name: str, args):
     """
-    set_name ∈ {"train","val","test"}.
+    set_name ∈ {"train", "val"}.
+    args.tokenizer should be a HuggingFace tokenizer (same as RP).
 
-    Train mode (args.eval/args.test False):
-      - uses train_* dirs
-      - splits into train/val by val_split_ratio
-
-    Eval/Test mode (args.eval True OR args.test True OR set_name=="test"):
-      - uses eval_* dirs
-      - returns 100% of eval set (no split, no GPT)
+    Config-driven S3 keys (NO new key names):
+      - bucket
+      - images_prefix
+      - labels_prefix
+      - csv_key
     """
-    eval_mode = bool(getattr(args, "eval", False)) or bool(getattr(args, "test", False)) or (set_name == "test")
-
-    if eval_mode:
-        images_dir = _require(args, "eval_images_dir")
-        annotations_dir = _require(args, "eval_annotations_dir")
-        csv_path = getattr(args, "eval_csv_path", None) or getattr(args, "train_csv_path", None) or _require(args, "csv_path")
-        sources = _Sources(images_dir=images_dir, annotations_dir=annotations_dir, csv_path=str(csv_path))
-
-        full = DotaModulatedDetection(
-            tokenizer=args.tokenizer,
-            return_tokens=True,
-            sources=sources,
-            seed=getattr(args, "seed", 42),
-            val_split_ratio=0.0,
-            augment_train=False,
-            eval_mode=True,
-        )
-        full.ids = full.ids_all
-        return _WrappedDataset(full, _dota_transforms("val"))
-
-    # Train/Val mode
-    images_dir = _require(args, "train_images_dir")
-    annotations_dir = _require(args, "train_annotations_dir")
-    csv_path = getattr(args, "train_csv_path", None) or _require(args, "csv_path")
-    sources = _Sources(images_dir=images_dir, annotations_dir=annotations_dir, csv_path=str(csv_path))
+    sources = _sources_from_args(args)
 
     full = DotaModulatedDetection(
         tokenizer=args.tokenizer,
         return_tokens=True,
-        sources=sources,
-        val_split_ratio=getattr(args, "val_split_ratio", 0.2),
-        seed=getattr(args, "seed", 42),
+        val_split_ratio=_get_arg_float(args, "val_split_ratio", 0.2),
+        seed=_get_arg_int(args, "seed", 42),
         augment_train=(set_name == "train"),
-        eval_mode=False,
+        sources=sources,
     )
 
     if set_name == "train":
@@ -744,9 +632,7 @@ class _ConvertDotaToTarget:
         keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
         boxes = boxes[keep]
 
-        labels_1b = torch.tensor(
-            [a["category_id"] for a in original_annotations], dtype=torch.int64
-        )[keep]
+        labels_1b = torch.tensor([a["category_id"] for a in original_annotations], dtype=torch.int64)[keep]
         labels = labels_1b - 1
 
         area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])

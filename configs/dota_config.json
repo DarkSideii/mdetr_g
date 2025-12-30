@@ -1,10 +1,8 @@
 {
-  "train_images_dir": "s3://research-mdetr-g/DIOR-RSVG/train_images/",
-  "train_annotations_dir": "s3://research-mdetr-g/DIOR-RSVG/train_annotations/",
-  "train_csv_path": "s3://research-mdetr-g/DIOR-RSVG/dota_sentencesv2.csv",
-  "val_split_ratio": 0.1,
+  "bucket": "research-geodatasets",
+  "images_prefix": "DOTAv2/images/",
+  "labels_prefix": "DOTAv2/labels/",
+  "csv_key": "DOTAv2/dota_sentencesv2.csv",
 
-  "eval_images_dir": "s3://research-mdetr-g/DIOR-RSVG/test_images/",
-  "eval_annotations_dir": "s3://research-mdetr-g/DIOR-RSVG/test_annotations/",
-  "eval_csv_path": "s3://research-mdetr-g/DIOR-RSVG/dota_sentencesv2.csv"
+  "val_split_ratio": 0.1
 }
