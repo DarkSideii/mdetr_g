@@ -5,3 +5,4 @@ mmcv/
 *_cache/
 runs/
 mlruns/
+__pycache__/
