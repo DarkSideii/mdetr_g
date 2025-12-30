@@ -70,7 +70,7 @@ def get_args_parser():
     p.add_argument("--frozen_weights",            default=None, type=str)
     p.add_argument("--freeze_text_encoder",       action="store_true")
     p.add_argument("--text_encoder_type",         default="sentence-transformers/all-MiniLM-L6-v2", type=str, help="HF model name for text encoder (e.g. roberta-base, sentence-transformers/all-MiniLM-L6-v2)")
-    p.add_argument("--backbone",                  default="ConvNeXt", type=str, help="Backbone CNN, e.g. ConvNeXt, convnext_tiny/small/base/large, or timm_<name>")
+    p.add_argument("--backbone",                  default="satlas_aerial_swinb", type=str, help="vision backbone selection")
     p.add_argument("--dilation",                  action="store_true")
     p.add_argument("--position_embedding",        default="sine", choices=("sine", "learned"))
 
