@@ -126,7 +126,7 @@ def get_args_parser():
     group.add_argument("--no_text_cross_attn",    dest="use_text_cross_attn", action="store_false", help="Disable decoder cross-attention to text tokens")
     p.set_defaults(use_text_cross_attn=True)
 
-    p.add_argument("--dataset_file",              default="dior_rsvg", choices=("dior_rsvg",), help="Which dataset to use (fresh start: DIOR-RSVG).")
+    p.add_argument("--dataset_file",              default="dota", choices=("dota",), help="Which dataset to use.")
 
     p.add_argument("--transformer_type",          default="deformable", choices=("deformable", "vanilla"), help="deformable = MSDeformAttn (MMCV); vanilla = standard MultiheadAttention (no deformable attn).")
     p.add_argument("--no_deformable_attn",        action="store_true", help="Alias for --transformer_type vanilla")
