@@ -327,7 +327,7 @@ class DotaModulatedDetection(Dataset):
 
         self.annotations = ann_raw
         self.ids_all = list(ann_raw)
-        self.ids = self.ids_all  # <- safety default; build_dota() will override
+        self.ids = self.ids_all  
 
         self.ids_train, self.ids_val = self._split_groups(ann_raw, val_split_ratio)
         if not self.ids_val:
@@ -611,6 +611,17 @@ class _WrappedDataset(torch.utils.data.Dataset):
 
 # ───────────────────── dataset builders ─────────────────────
 def build_dota(set_name: str, args):
+    """
+    set_name ∈ {"train", "val", "test"}.
+
+    NOTE:
+      - main.py uses image_set="test" in eval_mode, so we treat "test" as an alias of "val".
+      - S3 config keys remain the same (NO new key names):
+          - bucket
+          - images_prefix
+          - labels_prefix
+          - csv_key
+    """
     sources = _sources_from_args(args)
 
     full = DotaModulatedDetection(
@@ -626,7 +637,7 @@ def build_dota(set_name: str, args):
         full.ids = full.ids_train
         return _WrappedDataset(full, _dota_transforms("train"))
 
-    if set_name == "val":
+    if set_name in ("val", "test"):
         full.ids = full.ids_val
         return _WrappedDataset(full, _dota_transforms("val"))
 
