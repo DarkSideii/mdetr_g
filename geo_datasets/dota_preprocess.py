@@ -24,7 +24,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-import multimodal_framework.mdetr.datasets.transforms as T
+import mdetr.datasets.transforms as T
 from util.augs import (
     RandomColorJitter,
     RandomGaussianBlur,
@@ -35,7 +35,17 @@ from util.augs import (
 # ─────────────────────────────── setup ────────────────────────────────
 load_dotenv()
 random.seed(42)
-_openai = OpenAI()
+
+# If OPENAI_API_KEY is not set, OpenAI() will raise.
+# We don't want to crash in that case—just disable GPT augmentation.
+_OPENAI_WARNED = False
+try:
+    _openai = OpenAI()
+except Exception as e:
+    _openai = None
+    _OPENAI_WARNED = True
+    print(f"[DOTA] OpenAI client disabled (no API key or init error): {e}")
+
 _S3_CFG = Config(
     retries={"max_attempts": 10, "mode": "adaptive"},
     connect_timeout=10,
@@ -91,15 +101,32 @@ def _split_sents(txt: str) -> List[str]:
 def _call_gpt(existing: List[str], need: int) -> List[str]:
     if need <= 0:
         return []
+
+    # If OpenAI client isn't available, silently skip augmentation.
+    global _OPENAI_WARNED
+    if _openai is None:
+        if not _OPENAI_WARNED:
+            _OPENAI_WARNED = True
+            print("[DOTA] OpenAI client is None -> skipping GPT caption augmentation.")
+        return []
+
     # RP-style: only a single user message
     prefix = (_CAP_PROMPT + "\n\n") if _CAP_PROMPT else ""
     user_msg = prefix + "Here are the existing sentences:\n" + "\n".join(f"- {s}" for s in existing)
 
-    resp = _openai.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": user_msg}],
-        temperature=0.1,
-    )
+    try:
+        resp = _openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": user_msg}],
+            temperature=0.1,
+        )
+    except Exception as e:
+        # Don't crash training if key is missing / revoked / rate-limited / etc.
+        if not _OPENAI_WARNED:
+            _OPENAI_WARNED = True
+            print(f"[DOTA] GPT caption augmentation failed; continuing without augmentation: {e}")
+        return []
+
     raw = resp.choices[0].message.content
     # Strip numbering/bullets that models sometimes add
     lines = [
@@ -584,16 +611,6 @@ class _WrappedDataset(torch.utils.data.Dataset):
 
 # ───────────────────── dataset builders ─────────────────────
 def build_dota(set_name: str, args):
-    """
-    set_name ∈ {"train", "val"}.
-    args.tokenizer should be a HuggingFace tokenizer (same as RP).
-
-    Config-driven S3 keys (NO new key names):
-      - bucket
-      - images_prefix
-      - labels_prefix
-      - csv_key
-    """
     sources = _sources_from_args(args)
 
     full = DotaModulatedDetection(
