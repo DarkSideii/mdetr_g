@@ -1,7 +1,7 @@
 # --- Core numerical / DL ---
 numpy==2.2.6
-torch==2.4.1
-torchvision==0.19.1
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
 
 # --- Transformers (text encoder) ---
 transformers==4.46.3
@@ -14,9 +14,11 @@ timm==1.0.19
 satlaspretrain-models==0.3.1
 
 # --- Deformable attention (MMCV op) ---
-mmcv==2.2.0
 mmengine==0.10.7
-# (Install a CUDA-matching wheel for mmcv; openmim is optional and not required at runtime.)
+openmim==0.3.9
+# IMPORTANT: do NOT pip install mmcv from PyPI for deformable attention.
+# Install MMCV with CUDA ops like this:
+#   mim install "mmcv==2.2.0" -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
 
 # --- Data / storage / cache ---
 boto3==1.34.162

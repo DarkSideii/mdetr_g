@@ -145,7 +145,7 @@ def count_params_model(model):
     return total, trainable
 
 
-def report_trainable_by_group(optimizer):
+def report_trainable_by_group(optimizer, verbose: bool = True):
     """Print a clean table and return a dict with key counts.
     - totals are per-group (can double-count the same tensor across groups)
     - *_dedup are union across groups (no double counting)
@@ -182,14 +182,15 @@ def report_trainable_by_group(optimizer):
                     if lr > 0.0:
                         eff_in_opt_dedup += p.numel()
 
-    # pretty print
-    print("\n── Optimizer param-groups ─────────────────────────────────")
-    print(f"{'group':<22} {'total':>12} {'requires_grad':>15} {'effective(lr>0)':>18}   {'lr':>10} {'wd':>8}")
-    for name, n_all, n_req, n_eff, lr, wd in rows:
-        print(f"{name:<22} {n_all:12,d} {n_req:15,d} {n_eff:18,d}   {lr:10.3g} {wd:8.3g}")
-    if overlap:
-        print("WARNING: some parameters appear in multiple param groups (overlap detected).")
-    print("───────────────────────────────────────────────────────────\n")
+    # pretty print (optional)
+    if verbose:
+        print("\n── Optimizer param-groups ─────────────────────────────────")
+        print(f"{'group':<22} {'total':>12} {'requires_grad':>15} {'effective(lr>0)':>18}   {'lr':>10} {'wd':>8}")
+        for name, n_all, n_req, n_eff, lr, wd in rows:
+            print(f"{name:<22} {n_all:12,d} {n_req:15,d} {n_eff:18,d}   {lr:10.3g} {wd:8.3g}")
+        if overlap:
+            print("WARNING: some parameters appear in multiple param groups (overlap detected).")
+        print("───────────────────────────────────────────────────────────\n")
 
     return {
         "in_optimizer_dedup_total": all_in_opt_dedup,
@@ -400,14 +401,16 @@ def main(args):
             mlflow.log_param("n_parameters_total", int(total_params))
             mlflow.log_param("n_parameters_requires_grad", int(trainable_params))
 
-        opt_stats = report_trainable_by_group(optimizer)
+        # NOTE: Do not print optimizer param-groups during eval/test
+        opt_stats = report_trainable_by_group(optimizer, verbose=not eval_mode)
 
         missing_from_optimizer = trainable_params - opt_stats["in_optimizer_dedup_requires_grad"]
-        if missing_from_optimizer != 0:
+        if (missing_from_optimizer != 0) and (not eval_mode):
             print(f"WARNING: {missing_from_optimizer:,} trainable parameters are not in the optimizer param_groups.")
 
         effective_trainable = opt_stats["in_optimizer_dedup_effective"]
-        print(f"Effective trainable (requires_grad & lr>0): {effective_trainable:,}")
+        if not eval_mode:
+            print(f"Effective trainable (requires_grad & lr>0): {effective_trainable:,}")
         if is_main:
             mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", int(effective_trainable))
 
