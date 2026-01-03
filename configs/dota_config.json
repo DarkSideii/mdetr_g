@@ -2,6 +2,6 @@
   "bucket": "research-geodatasets",
   "images_prefix": "DOTAv2/images/",
   "labels_prefix": "DOTAv2/labels/",
-  "csv_key": "DOTAv2/dota_sentencesv2.csv",
+  "csv_key": "DOTAv2/test_dota_sentencesv2.csv",
   "val_split_ratio": 0.1
 }

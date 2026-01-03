@@ -1,6 +1,7 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic cuBLAS
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import sys
 from pathlib import Path
 from copy import deepcopy
@@ -59,7 +60,11 @@ def get_args_parser():
     p.add_argument("--weight_decay",              default=1e-4, type=float)
     p.add_argument("--optimizer",                 default="adam", type=str)
     p.add_argument("--clip_max_norm",             default=0.1, type=float)
-    p.add_argument("--schedule",                  default="linear_with_warmup", choices=("step", "multistep", "linear_with_warmup", "all_linear_with_warmup", "all_cosine_with_warmup"))
+    p.add_argument(
+        "--schedule",
+        default="linear_with_warmup",
+        choices=("step", "multistep", "linear_with_warmup", "all_linear_with_warmup", "all_cosine_with_warmup"),
+    )
     p.add_argument("--lr_drop",                   default=35, type=int, help="Epoch milestone for *step* or *multistep* sched")
     p.add_argument("--fraction_warmup_steps",     default=0.01, type=float)
     p.add_argument("--ema",                       action="store_true")
@@ -69,7 +74,12 @@ def get_args_parser():
     # 4) model-level knobs
     p.add_argument("--frozen_weights",            default=None, type=str)
     p.add_argument("--freeze_text_encoder",       action="store_true")
-    p.add_argument("--text_encoder_type",         default="sentence-transformers/all-MiniLM-L6-v2", type=str, help="HF model name for text encoder (e.g. roberta-base, sentence-transformers/all-MiniLM-L6-v2)")
+    p.add_argument(
+        "--text_encoder_type",
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        type=str,
+        help="HF model name for text encoder (e.g. roberta-base, sentence-transformers/all-MiniLM-L6-v2)",
+    )
     p.add_argument("--backbone",                  default="satlas_aerial_swinb", type=str, help="vision backbone selection")
     p.add_argument("--dilation",                  action="store_true")
     p.add_argument("--position_embedding",        default="sine", choices=("sine", "learned"))
@@ -134,15 +144,16 @@ def get_args_parser():
     p.add_argument("--cls_scale_mode",            default="learnable", choices=("learnable", "off"), help="Ablation: learnable multiplies pred_logits by exp(logit_scale_cls); off disables cls scaling (original MDETR-style).")
     return p
 
+
 def count_params_model(model):
     total = 0
-    trainable = 0
+    reqgrad = 0
     for p in model.parameters():
         n = p.numel()
         total += n
         if p.requires_grad:
-            trainable += n
-    return total, trainable
+            reqgrad += n
+    return total, reqgrad
 
 
 def report_trainable_by_group(optimizer, verbose: bool = True):
@@ -182,7 +193,6 @@ def report_trainable_by_group(optimizer, verbose: bool = True):
                     if lr > 0.0:
                         eff_in_opt_dedup += p.numel()
 
-    # pretty print (optional)
     if verbose:
         print("\n── Optimizer param-groups ─────────────────────────────────")
         print(f"{'group':<22} {'total':>12} {'requires_grad':>15} {'effective(lr>0)':>18}   {'lr':>10} {'wd':>8}")
@@ -214,12 +224,10 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
     for k, v in d.items():
         name = f"{prefix}{k}" if prefix else k
 
-        # Pure scalars
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             flat[name] = float(v)
             continue
 
-        # Torch tensors
         if torch.is_tensor(v):
             v_cpu = v.detach().cpu()
             if v_cpu.numel() == 1:
@@ -231,7 +239,6 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
                 flat[name + "/max"] = float(arr.max())
             continue
 
-        # Numpy arrays / lists / tuples
         if isinstance(v, (list, tuple, np.ndarray)):
             try:
                 arr = np.array(v, dtype=float).flatten()
@@ -245,7 +252,6 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
                 pass
             continue
 
-        # Nested dicts
         if isinstance(v, dict):
             flat.update(_flatten_metrics_for_mlflow(v, prefix=name + "/"))
             continue
@@ -281,9 +287,9 @@ def main(args):
     except TypeError:
         torch.set_deterministic(True)
 
-    is_main = utils.is_main_process()  # ← for safe logging in DDP/multiprocess
+    is_main = utils.is_main_process()  # safe logging in DDP/multiprocess
 
-    # treat eval + test as "eval mode" (held-out set, 100%)
+    # treat eval + test as eval mode
     eval_mode = bool(getattr(args, "eval", False)) or bool(getattr(args, "test", False))
 
     # ----------------- MLFLOW RUN -----------------
@@ -313,6 +319,12 @@ def main(args):
         model.to(device)
         args.tokenizer = model.tokenizer  # expose to dataset builder
 
+        # IMPORTANT FIX:
+        # In eval/test mode, freeze EVERYTHING so requires_grad=0 and we don't build an optimizer.
+        if eval_mode:
+            for p in model.parameters():
+                p.requires_grad_(False)
+
         # --- EMA: create the shadow copy (frozen, no-grad) ----------------------
         model_ema = deepcopy(model) if getattr(args, "ema", False) else None
         if model_ema is not None:
@@ -321,98 +333,108 @@ def main(args):
             print(f"[EMA] enabled (decay={args.ema_decay}). EMA weights will be used for eval/checkpoints.")
 
         # ---------------- optimiser ----------------
-        extra_groups = getattr(model, "extra_optim_groups", [])
-        extra_param_ids = {id(p) for g in extra_groups for p in g.get("params", []) if p is not None}
+        optimizer = None
+        opt_stats = None
+        effective_trainable = 0
 
-        backbone_params, textenc_params, base_params = [], [], []
-        for n, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
+        if not eval_mode:
+            extra_groups = getattr(model, "extra_optim_groups", [])
+            extra_param_ids = {id(p) for g in extra_groups for p in g.get("params", []) if p is not None}
 
-            # keep extra params OUT of base/backbone/text groups
-            if id(p) in extra_param_ids:
-                continue
+            backbone_params, textenc_params, base_params = [], [], []
+            for n, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
 
-            if n.startswith("backbone."):
-                backbone_params.append(p)
-            elif n.startswith("transformer.text_encoder."):
-                textenc_params.append(p)
-            else:
-                base_params.append(p)
+                # keep extra params OUT of base/backbone/text groups
+                if id(p) in extra_param_ids:
+                    continue
 
-        param_groups = [
-            {
-                "name": "base",
-                "params": base_params,
-                "lr": args.lr,
-                "base_lr": args.lr,
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "name": "backbone",
-                "params": backbone_params,
-                "lr": args.lr_backbone,
-                "base_lr": args.lr_backbone,
-                "weight_decay": args.weight_decay,
-            },
-        ]
+                if n.startswith("backbone."):
+                    backbone_params.append(p)
+                elif n.startswith("transformer.text_encoder."):
+                    textenc_params.append(p)
+                else:
+                    base_params.append(p)
 
-        if len(textenc_params) > 0:
-            param_groups.append(
+            param_groups = [
                 {
-                    "name": "text",
-                    "params": textenc_params,
-                    "lr": args.text_encoder_lr,
-                    "base_lr": args.text_encoder_lr,
+                    "name": "base",
+                    "params": base_params,
+                    "lr": args.lr,
+                    "base_lr": args.lr,
                     "weight_decay": args.weight_decay,
-                }
-            )
+                },
+                {
+                    "name": "backbone",
+                    "params": backbone_params,
+                    "lr": args.lr_backbone,
+                    "base_lr": args.lr_backbone,
+                    "weight_decay": args.weight_decay,
+                },
+            ]
 
-        # Append extra groups LAST (e.g., logit scales)
-        already = {id(p) for g in param_groups for p in g["params"]}
-        for g in extra_groups:
-            params = [p for p in g.get("params", []) if p is not None and p.requires_grad and id(p) not in already]
-            if params:
+            if len(textenc_params) > 0:
                 param_groups.append(
                     {
-                        "name": g.get("name", "extra"),
-                        "params": params,
-                        "lr": g.get("lr", args.lr),
-                        "base_lr": g.get("base_lr", g.get("lr", args.lr)),
-                        "weight_decay": g.get("weight_decay", 0.0),
+                        "name": "text",
+                        "params": textenc_params,
+                        "lr": args.text_encoder_lr,
+                        "base_lr": args.text_encoder_lr,
+                        "weight_decay": args.weight_decay,
                     }
                 )
 
-        # Normalize optimizer choice
-        opt = str(getattr(args, "optimizer", "adamw")).lower()
-        if opt == "sgd":
-            optimizer = torch.optim.SGD(param_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
-        elif opt == "adam":
-            optimizer = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-        elif opt == "adamw":
-            optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
-        else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer!r}")
+            # Append extra groups LAST (e.g., logit scales)
+            already = {id(p) for g in param_groups for p in g["params"]}
+            for g in extra_groups:
+                params = [p for p in g.get("params", []) if p is not None and p.requires_grad and id(p) not in already]
+                if params:
+                    param_groups.append(
+                        {
+                            "name": g.get("name", "extra"),
+                            "params": params,
+                            "lr": g.get("lr", args.lr),
+                            "base_lr": g.get("base_lr", g.get("lr", args.lr)),
+                            "weight_decay": g.get("weight_decay", 0.0),
+                        }
+                    )
 
-        # Accurate counts & audit
-        total_params, trainable_params = count_params_model(model)
-        print(f"Model params: total={total_params:,}  trainable(requires_grad)={trainable_params:,}")
+            # Normalize optimizer choice
+            opt = str(getattr(args, "optimizer", "adamw")).lower()
+            if opt == "sgd":
+                optimizer = torch.optim.SGD(param_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+            elif opt == "adam":
+                optimizer = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+            elif opt == "adamw":
+                optimizer = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+            else:
+                raise ValueError(f"Unsupported optimizer: {args.optimizer!r}")
+
+        # Accurate counts & audit (after freezing in eval_mode)
+        total_params, reqgrad_params = count_params_model(model)
+        if eval_mode:
+            print(f"Model params: total={total_params:,}  requires_grad={reqgrad_params:,} (eval_mode: frozen)")
+        else:
+            print(f"Model params: total={total_params:,}  trainable(requires_grad)={reqgrad_params:,}")
+
         if is_main:
             mlflow.log_param("n_parameters_total", int(total_params))
-            mlflow.log_param("n_parameters_requires_grad", int(trainable_params))
+            mlflow.log_param("n_parameters_requires_grad", int(reqgrad_params))
 
-        # NOTE: Do not print optimizer param-groups during eval/test
-        opt_stats = report_trainable_by_group(optimizer, verbose=not eval_mode)
-
-        missing_from_optimizer = trainable_params - opt_stats["in_optimizer_dedup_requires_grad"]
-        if (missing_from_optimizer != 0) and (not eval_mode):
-            print(f"WARNING: {missing_from_optimizer:,} trainable parameters are not in the optimizer param_groups.")
-
-        effective_trainable = opt_stats["in_optimizer_dedup_effective"]
+        # Only audit optimizer groups in train mode
         if not eval_mode:
+            opt_stats = report_trainable_by_group(optimizer, verbose=True)
+            missing_from_optimizer = reqgrad_params - opt_stats["in_optimizer_dedup_requires_grad"]
+            if missing_from_optimizer != 0:
+                print(f"WARNING: {missing_from_optimizer:,} trainable parameters are not in the optimizer param_groups.")
+            effective_trainable = opt_stats["in_optimizer_dedup_effective"]
             print(f"Effective trainable (requires_grad & lr>0): {effective_trainable:,}")
-        if is_main:
-            mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", int(effective_trainable))
+            if is_main:
+                mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", int(effective_trainable))
+        else:
+            if is_main:
+                mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", 0)
 
         # ---------------- datasets ----------------
         if eval_mode:
@@ -432,11 +454,9 @@ def main(args):
                 prefetch_factor=1,
             )
 
-            # placeholders (not used in eval mode)
             ds_train = None
             dl_train = None
         else:
-            # train mode: build train + val (split handled by dataset code)
             ds_train = build_dataset(args.dataset_file, "train", args)
             ds_val = build_dataset(args.dataset_file, "val", args)
             print(f" train images: {len(ds_train)}\n val images: {len(ds_val)}")
@@ -462,7 +482,7 @@ def main(args):
                 prefetch_factor=1,
             )
 
-        # evaluator & post-processofdjhbfsdjbfdsj
+        # evaluator & post-process
         postprocessors = build_postprocessors(args, args.dataset_file)
 
         # ---------------- checkpoints ----------------
@@ -484,7 +504,7 @@ def main(args):
         if args.resume and not args.load:
             ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
             model.load_state_dict(ckpt["model"], strict=True)
-            if "optimizer" in ckpt and not eval_mode:
+            if "optimizer" in ckpt and (not eval_mode) and (optimizer is not None):
                 optimizer.load_state_dict(ckpt["optimizer"])
             args.start_epoch = ckpt.get("epoch", 0) + 1
 
@@ -502,17 +522,20 @@ def main(args):
         if eval_mode:
             test_model = model_ema if model_ema is not None else model
             evaluator = EvaluatorCls(ds_val, use_cats=False)
-            stats = evaluate(
-                test_model,
-                criterion,
-                contrastive_criterion,
-                weight_dict,
-                dl_val,
-                postprocessors,
-                [evaluator],
-                device,
-                args,
-            )
+
+            # Strong no-grad for eval
+            with torch.inference_mode():
+                stats = evaluate(
+                    test_model,
+                    criterion,
+                    contrastive_criterion,
+                    weight_dict,
+                    dl_val,
+                    postprocessors,
+                    [evaluator],
+                    device,
+                    args,
+                )
             print(json.dumps({f"test_{k}": v for k, v in stats.items()}, indent=2))
             return
 
@@ -609,7 +632,7 @@ def main(args):
                         **{f"val_{k}": v for k, v in val_stats.items()},
                         "epoch": epoch,
                         "n_parameters_total": int(total_params),
-                        "n_parameters_requires_grad": int(trainable_params),
+                        "n_parameters_requires_grad": int(reqgrad_params),
                         "n_parameters_effective_trainable_lr_gt_0": int(effective_trainable),
                     }) + "\n")
 

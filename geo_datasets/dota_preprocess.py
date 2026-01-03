@@ -614,13 +614,10 @@ def build_dota(set_name: str, args):
     """
     set_name ∈ {"train", "val", "test"}.
 
-    NOTE:
-      - main.py uses image_set="test" in eval_mode, so we treat "test" as an alias of "val".
-      - S3 config keys remain the same (NO new key names):
-          - bucket
-          - images_prefix
-          - labels_prefix
-          - csv_key
+    Split behavior:
+      - train: uses the train split (split handled inside DotaModulatedDetection)
+      - val:   uses the val split
+      - test:  NO SPLIT. Uses the full dataset (all samples in ids_all)
     """
     sources = _sources_from_args(args)
 
@@ -637,8 +634,13 @@ def build_dota(set_name: str, args):
         full.ids = full.ids_train
         return _WrappedDataset(full, _dota_transforms("train"))
 
-    if set_name in ("val", "test"):
+    if set_name == "val":
         full.ids = full.ids_val
+        return _WrappedDataset(full, _dota_transforms("val"))
+
+    if set_name == "test":
+        # NO split for test: include the whole dataset
+        full.ids = full.ids_all
         return _WrappedDataset(full, _dota_transforms("val"))
 
     raise ValueError(set_name)
