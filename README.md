@@ -11,7 +11,8 @@ MDETR-G modifies the original MDETR design in a few key ways:
 
 - **Deformable attention** for more efficient multi-scale spatial reasoning (especially helpful in high-resolution imagery).
 - **Swin Transformer backbone** tuned for aerial/overhead imagery (stronger hierarchical feature extraction than natural-image backbones). 
-- **Learnable contrastive temperature (τ)** in the text–image alignment objective (rather than a fixed constant).  
+- **Learnable contrastive temperature (τ)** in the text–image alignment objective (rather than a fixed constant).
+- **Learnable classification logit temperature (τ_cls) (inverse-temperature / logit-scale on the decoder’s class logits)** to improve confidence calibration and stabilize optimization under soft token targets.
 - **Shallower transformer (3 encoder / 3 decoder layers)** to improve training/inference efficiency.
 
 Under the hood, MDETR-G still uses:
@@ -27,20 +28,32 @@ Given an image and a natural-language query, MDETR-G predicts bounding boxes cor
 
 ## Evaluation note (terminology)
 
-## Training environment (DGX Spark)
+## Training environment
 
-All experiments reported for **MDETR-G** were run on an **NVIDIA DGX Spark** (Grace Blackwell) system.
+All experiments reported for MDETR-G were run on an NVIDIA DGX Spark (Grace Blackwell) system and an RTX 5000 Ada workstation.
 
-- **GPU:** NVIDIA **GB10** (Blackwell architecture, **sm_121 / compute capability 12.1**)
-- **Memory:** **128 GB** coherent **unified system memory** (shared between CPU and GPU).  
-  *Note:* tooling may report slightly less usable “GPU memory” due to reservations/overhead.
-
+**System A (DGX Spark / Grace Blackwell)**
+- GPU: NVIDIA GB10 (Blackwell architecture, sm_121 / compute capability 12.1)
+- Memory: 128 GB coherent unified system memory (shared between CPU and GPU)
+  - Note: tooling may report slightly less usable “GPU memory” due to reservations/overhead.
+- Use requirements.txt for Spark specific library imports
+- See GX Spark specific configurations section for more information
+  
+**System B (Workstation)**
+- GPU: NVIDIA RTX 5000 Ada Generation
+- Memory: 32 GB device (VRAM) (typical RTX 5000 Ada configuration).
+- A requirementsv2,txt is given for specific libraries needed.
+- 
 Quick sanity checks:
 ```bash
 nvidia-smi
 python -c "import torch; print(torch.cuda.get_device_name(0)); print(round(torch.cuda.get_device_properties(0).total_memory/1024**3, 2), 'GB')"
 ```
-### Deformable attention (MMCV) on DGX Spark
+### DGX Spark specific configurations
+
+An venv was created using pyenv’s 3.11.9.
+
+#### Deformable attention (MMCV) on DGX Spark
 
 The deformable transformer path uses MMCV’s CUDA op:
 mmcv.ops.multi_scale_deform_attn.MultiScaleDeformableAttention.
@@ -50,8 +63,9 @@ mmcv.ops.multi_scale_deform_attn.MultiScaleDeformableAttention.
 - install a CUDA-enabled PyTorch build compatible with Spark (cu130 wheels), and
 - build MMCV from source with CUDA ops enabled (otherwise mmcv._ext is missing and deformable attention won’t load).
 
-#### Summary
+##### Summary
 
+- Created a venv with python 3.11.9
 - Installed PyTorch from the CUDA 13 wheel index (cu130)
 - Cloned MMCV and built/install with ops enabled, targeting GB10 (TORCH_CUDA_ARCH_LIST="12.1")
 - Disabled pip build isolation so MMCV can “see” the installed torch when compiling ops
@@ -81,11 +95,12 @@ python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAtte
 ```
 ## Python version
 
-All experiments were ran with **Python 3.11 (tested on 3.11.9)**.
+All experiments were ran with **Python 3.11**.
 
 **Why 3.11?**
 - On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack we used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
 - Python 3.11 generally has the broadest support across the ecosystem for compiled ML/CV dependencies.
-
+- Workstation used the same version of python.
+- 
 **Setup note (pyenv):**
 If you install Python via `pyenv`, make sure `liblzma-dev` is installed *before* building Python, otherwise the stdlib `lzma` module may be missing (`ModuleNotFoundError: No module named '_lzma'`).
