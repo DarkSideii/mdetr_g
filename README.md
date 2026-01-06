@@ -32,8 +32,8 @@ Given an image and a natural-language query, MDETR-G predicts bounding boxes cor
 The dataset is a curated subset of the DOTA-v1.5 benchmark, restricted specifically to ship and plane objects found within tiled aerial imagery. To enable phrase grounding, each image is paired with synthetic, object-centric captions that explicitly reference every annotated instance in the scene.
 
 ### Dataset structure
--**train/val**: contains the tiles, annotations, and captions used to train/validate MDETR-G.
--**test**: contains the tiles, annotations, and captions to test MDETR-G on unseen data. 
+- **train/val**: contains the tiles, annotations, and captions used to train/validate MDETR-G.
+- **test**: contains the tiles, annotations, and captions to test MDETR-G on unseen data. 
 
 ## Training environment
 
