@@ -1,3 +1,5 @@
+"""MDETR model, losses, and build utilities."""
+
 from typing import Optional
 import math
 
@@ -14,18 +16,8 @@ from .matcher import build_matcher
 from .transformer import build_transformer
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
 class MDETR(nn.Module):
-    """
-    Modulated DETR:
-    - Multi-scale deformable encoder/decoder over image features
-    - Text encoder fused via cross-attention inside decoder (optionally)
-    - **Fixed** 255-token linear classification head (+1 background)
-    - Optional global contrastive and token–box contrastive align losses
-    """
+    """Modulated DETR with optional image–text contrastive losses."""
 
     def __init__(
         self,
@@ -47,32 +39,29 @@ class MDETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
 
-        # expose tokenizer if present (used by datasets & alignment)
+        # Expose tokenizer for dataset builders / alignment.
         if hasattr(transformer, "tokenizer"):
             self.tokenizer = transformer.tokenizer
 
-        # heads
-        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)  # fixed 255 (+background)
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
-        # ---- Multi-level projections (one per backbone stage) --------------
+        # Multi-level projections (one per feature level when multi-scale is enabled).
         self.multi_scale = getattr(transformer, "multi_scale", False)
         self.num_feature_levels = getattr(transformer, "num_feature_levels", 1)
         if self.multi_scale and self.num_feature_levels > 1:
             if hasattr(backbone, "channels"):
-                in_ch = backbone.channels[-self.num_feature_levels:]  # e.g., last 3–4 levels
+                in_ch = backbone.channels[-self.num_feature_levels:]
             else:
                 in_ch = [backbone.num_channels] * self.num_feature_levels
-            self.input_proj = nn.ModuleList(
-                [nn.Conv2d(c, hidden_dim, kernel_size=1) for c in in_ch]
-            )
+            self.input_proj = nn.ModuleList([nn.Conv2d(c, hidden_dim, kernel_size=1) for c in in_ch])
         else:
             self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
 
-        # Learnable temperatures
+        # Optional temperature scaling on class logits.
         self.cls_scale_mode = cls_scale_mode
-        self.logit_scale_cls = nn.Parameter(torch.tensor(math.log(1 / 0.07)))  # for cls logits
+        self.logit_scale_cls = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
         if self.cls_scale_mode == "learnable":
             self.logit_scale_cls.requires_grad_(True)
         elif self.cls_scale_mode == "off":
@@ -83,53 +72,46 @@ class MDETR(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-        # ---- global image–text contrastive (optional) ----------------------
+        # Global image–text contrastive (optional).
         self.contrastive_loss = contrastive_loss
         if contrastive_loss:
             self.contrastive_projection_image = nn.Linear(hidden_dim, contrastive_hdim, bias=False)
-            # robust to any HF text encoder
             txt_h = getattr(self.transformer, "text_hidden_dim", None)
             if txt_h is None:
                 txt_h = self.transformer.text_encoder.config.hidden_size
             self.contrastive_projection_text = nn.Linear(txt_h, contrastive_hdim, bias=False)
 
-        # ---- token–box contrastive alignment (optional) --------------------
+        # Token–box contrastive alignment (optional).
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
             self.contrastive_align_projection_image = nn.Linear(hidden_dim, contrastive_hdim)
             self.contrastive_align_projection_text = nn.Linear(hidden_dim, contrastive_hdim)
 
-            # keep the tensor in the state_dict either way (helps loading checkpoints across modes)
+            # Keep in state_dict across modes for checkpoint compatibility.
             self.logit_scale_align = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
             self.align_scale_mode = align_scale_mode
 
             if self.align_scale_mode == "learnable":
                 self.logit_scale_align.requires_grad_(True)
             elif self.align_scale_mode == "hardcoded":
-                # exists, but is not trained and will be ignored in the loss computation
                 self.logit_scale_align.requires_grad_(False)
             else:
                 raise ValueError(f"Unknown align_scale_mode={self.align_scale_mode!r}")
         else:
             self.logit_scale_align = None
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
     def forward(self, samples: NestedTensor, captions, encode_and_save: bool = True, memory_cache=None):
+        """Encode into a cache (encode_and_save=True) or decode from an existing cache."""
         if not isinstance(samples, NestedTensor):
             samples = NestedTensor.from_tensor_list(samples)
 
-        # ------------------------ 1) ENCODE & CACHE -------------------------
         if encode_and_save:
             assert memory_cache is None
 
-            features, pos = self.backbone(samples)  # these lists are already length K
-            feats = features
-            poses = pos
+            features, pos = self.backbone(samples)
 
             srcs, masks, poses2 = [], [], []
-            for lvl, (f, p) in enumerate(zip(feats, poses)):
+            for lvl, (f, p) in enumerate(zip(features, pos)):
                 s, m = f.decompose()
                 proj = self.input_proj[lvl](s) if isinstance(self.input_proj, nn.ModuleList) else self.input_proj(s)
                 srcs.append(proj)
@@ -150,115 +132,102 @@ class MDETR(nn.Module):
 
             if self.contrastive_loss:
                 if memory_cache.get("text_pooled_op") is not None:
-                    memory_cache["text_pooled_op"] = self.contrastive_projection_text(
-                        memory_cache["text_pooled_op"]
-                    )
+                    memory_cache["text_pooled_op"] = self.contrastive_projection_text(memory_cache["text_pooled_op"])
                 if memory_cache.get("img_pooled_op") is not None:
-                    memory_cache["img_pooled_op"] = self.contrastive_projection_image(
-                        memory_cache["img_pooled_op"]
-                    )
+                    memory_cache["img_pooled_op"] = self.contrastive_projection_image(memory_cache["img_pooled_op"])
 
             return memory_cache
 
-        # --------------------------- 2) DECODE -------------------------------
-        else:
-            assert memory_cache is not None
+        assert memory_cache is not None
 
-            hs = self.transformer(
-                mask=memory_cache["mask"],
-                query_embed=memory_cache["query_embed"],
-                pos_embed=memory_cache["pos_embed"],
-                encode_and_save=False,
-                text_memory=memory_cache["text_memory_resized"],
-                img_memory=memory_cache["img_memory"],
-                text_attention_mask=memory_cache["text_attention_mask"],
-                spatial_shapes=memory_cache.get("spatial_shapes"),
-                level_start_index=memory_cache.get("level_start_index"),
-                valid_ratios=memory_cache.get("valid_ratios"),
+        hs = self.transformer(
+            mask=memory_cache["mask"],
+            query_embed=memory_cache["query_embed"],
+            pos_embed=memory_cache["pos_embed"],
+            encode_and_save=False,
+            text_memory=memory_cache["text_memory_resized"],
+            img_memory=memory_cache["img_memory"],
+            text_attention_mask=memory_cache["text_attention_mask"],
+            spatial_shapes=memory_cache.get("spatial_shapes"),
+            level_start_index=memory_cache.get("level_start_index"),
+            valid_ratios=memory_cache.get("valid_ratios"),
+        )
+
+        out = {}
+
+        outputs_coord = self.bbox_embed(hs).sigmoid()
+        if torch.isnan(outputs_coord).any():
+            raise RuntimeError("NaNs in pred_boxes – check token masking and attention masks.")
+
+        outputs_class = self.class_embed(hs)
+        if getattr(self, "cls_scale_mode", "learnable") == "learnable":
+            outputs_class = outputs_class * self.logit_scale_cls.exp().clamp(max=100.0)
+
+        out.update(
+            {
+                "pred_logits": outputs_class[-1],
+                "pred_boxes": outputs_coord[-1],
+            }
+        )
+
+        proj_queries, proj_tokens = None, None
+        if self.contrastive_align_loss:
+            proj_queries = F.normalize(self.contrastive_align_projection_image(hs), p=2, dim=-1)
+            proj_tokens = F.normalize(
+                self.contrastive_align_projection_text(memory_cache["text_memory"]).transpose(0, 1),
+                p=2,
+                dim=-1,
             )
-
-            out = {}
-
-            # Boxes
-            outputs_coord = self.bbox_embed(hs).sigmoid()
-            if torch.isnan(outputs_coord).any():
-                raise RuntimeError("NaNs in pred_boxes – check token masking and attention masks.")
-
-            # Fixed linear classification head (+ optional temperature scaling)
-            outputs_class = self.class_embed(hs)  # [L,B,Q, num_classes+1]
-            if getattr(self, "cls_scale_mode", "learnable") == "learnable":
-                outputs_class = outputs_class * self.logit_scale_cls.exp().clamp(max=100.0)
-
             out.update(
                 {
-                    "pred_logits": outputs_class[-1],  # [B,Q,C]
-                    "pred_boxes": outputs_coord[-1],   # [B,Q,4]
+                    "proj_queries": proj_queries[-1],
+                    "proj_tokens": proj_tokens,
+                    "tokenized": memory_cache["tokenized"],
+                    "logit_scale_align": (
+                        self.logit_scale_align.exp().clamp(max=100.0)
+                        if self.logit_scale_align is not None
+                        else None
+                    ),
                 }
             )
 
-            # Token–box contrastive alignment outputs
-            proj_queries, proj_tokens = None, None
+        if self.aux_loss:
             if self.contrastive_align_loss:
-                proj_queries = F.normalize(self.contrastive_align_projection_image(hs), p=2, dim=-1)
-                proj_tokens = F.normalize(
-                    self.contrastive_align_projection_text(memory_cache["text_memory"]).transpose(0, 1),
-                    p=2,
-                    dim=-1,
-                )
-                out.update(
+                align_scale = None
+                if self.align_scale_mode == "learnable" and (self.logit_scale_align is not None):
+                    align_scale = self.logit_scale_align.exp().clamp(max=100.0)
+                payload = {
+                    "proj_queries": proj_queries[-1],
+                    "proj_tokens": proj_tokens,
+                    "tokenized": memory_cache["tokenized"],
+                }
+                if align_scale is not None:
+                    payload["logit_scale_align"] = align_scale
+                out.update(payload)
+
+                assert proj_tokens is not None and proj_queries is not None
+                out["aux_outputs"] = [
                     {
-                        "proj_queries": proj_queries[-1],
+                        "pred_logits": a,
+                        "pred_boxes": b,
+                        "proj_queries": c,
                         "proj_tokens": proj_tokens,
                         "tokenized": memory_cache["tokenized"],
-                        "logit_scale_align": (
-                            self.logit_scale_align.exp().clamp(max=100.0)
-                            if self.logit_scale_align is not None
-                            else None
-                        ),
+                        **({"logit_scale_align": align_scale} if align_scale is not None else {}),
                     }
-                )
+                    for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], proj_queries[:-1])
+                ]
+            else:
+                out["aux_outputs"] = [
+                    {"pred_logits": a, "pred_boxes": b}
+                    for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+                ]
 
-            # Aux losses from intermediate decoder layers
-            if self.aux_loss:
-                if self.contrastive_align_loss:
-                    align_scale = None
-                    if self.align_scale_mode == "learnable" and (self.logit_scale_align is not None):
-                        align_scale = self.logit_scale_align.exp().clamp(max=100.0)
-                    payload = {
-                        "proj_queries": proj_queries[-1],
-                        "proj_tokens": proj_tokens,
-                        "tokenized": memory_cache["tokenized"],
-                    }
-                    if align_scale is not None:
-                        payload["logit_scale_align"] = align_scale
-                    out.update(payload)
+        return out
 
-                    assert proj_tokens is not None and proj_queries is not None
-                    out["aux_outputs"] = [
-                        {
-                            "pred_logits": a,
-                            "pred_boxes": b,
-                            "proj_queries": c,
-                            "proj_tokens": proj_tokens,
-                            "tokenized": memory_cache["tokenized"],
-                            **({"logit_scale_align": align_scale} if align_scale is not None else {}),
-                        }
-                        for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], proj_queries[:-1])
-                    ]
-                else:
-                    out["aux_outputs"] = [
-                        {"pred_logits": a, "pred_boxes": b}
-                        for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
-                    ]
-
-            return out
-
-
-# ---------------------------------------------------------------------------
-# Losses
-# ---------------------------------------------------------------------------
 
 class ContrastiveCriterion(nn.Module):
+    """Symmetric image↔text InfoNCE loss on pooled embeddings."""
     def __init__(self, temperature: float = 0.1):
         super().__init__()
         self.temperature = temperature
@@ -272,6 +241,7 @@ class ContrastiveCriterion(nn.Module):
         loss_i = F.cross_entropy(logits, labels)
         loss_t = F.cross_entropy(logits.t(), labels)
         return (loss_i + loss_t) / 2.0
+
 
 class SetCriterion(nn.Module):
     """Loss computation for DETR-like models."""
@@ -290,8 +260,8 @@ class SetCriterion(nn.Module):
         self.register_buffer("empty_weight", empty_weight)
 
     def loss_labels(self, outputs, targets, positive_map, indices, num_boxes):
-        """Classification loss (NLL) against per-box → token-index supervision (last index = background)."""
-        logits = outputs["pred_logits"].log_softmax(-1)  # [B,Q, num_tokens(+bg)]
+        """NLL loss against per-box token supervision (last index is background)."""
+        logits = outputs["pred_logits"].log_softmax(-1)
 
         src_idx = self._get_src_permutation_idx(indices)
         tgt_idx = []
@@ -301,10 +271,10 @@ class SetCriterion(nn.Module):
             offset += len(targets[i]["boxes"])
         tgt_idx = torch.cat(tgt_idx)
 
-        tgt_pos = positive_map[tgt_idx]  # (sum_K, num_tokens), no background
+        tgt_pos = positive_map[tgt_idx]
 
         target_sim = torch.zeros_like(logits)
-        target_sim[:, :, -1] = 1  # default to background
+        target_sim[:, :, -1] = 1
         target_sim[src_idx] = tgt_pos
 
         loss_ce = -(logits * target_sim).sum(-1)
@@ -320,11 +290,10 @@ class SetCriterion(nn.Module):
         normalized_text_emb = outputs["proj_tokens"]   # [B, T, h]
         normalized_img_emb = outputs["proj_queries"]   # [B, Q, h]
 
-        # Use model-provided scale if present; otherwise fall back to 1/temperature
+        # Scaling: learnable (if provided) or 1/temperature.
         if self.align_scale_mode == "learnable":
             scale = outputs.get("logit_scale_align", None)
             if scale is None:
-                # fallback: behave like hardcoded if scale wasn't provided
                 logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) / self.temperature
             else:
                 logits = torch.matmul(normalized_img_emb, normalized_text_emb.transpose(-1, -2)) * scale
@@ -333,13 +302,13 @@ class SetCriterion(nn.Module):
         else:
             raise ValueError(f"Unknown align_scale_mode={self.align_scale_mode!r}")
 
-        # Mask PAD tokens (attention_mask: 1=valid, 0=PAD)
+        # Mask PAD tokens (attention_mask: 1=valid, 0=PAD).
         if hasattr(tokenized, "attention_mask"):
-            pad_mask = (tokenized.attention_mask == 0).to(logits.device)  # [B, T], True=PAD
+            pad_mask = (tokenized.attention_mask == 0).to(logits.device)
             NEG_LARGE = -1e9
             logits = logits.masked_fill(pad_mask[:, None, :], NEG_LARGE)
 
-        # build pos_map via char_to_token
+        # Build a token-level positive map via char_to_token spans.
         pos_map = torch.zeros(logits.shape, dtype=torch.bool)
         for i, ((idx_src, idx_tgt), tgt) in enumerate(zip(indices, targets)):
             if "tokens_positive" in tgt:
@@ -397,7 +366,6 @@ class SetCriterion(nn.Module):
         device = pred_logits.device
 
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count predictions that are NOT background (last logit)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         return {"cardinality_error": card_err}
@@ -421,7 +389,6 @@ class SetCriterion(nn.Module):
         losses["loss_giou"] = loss_giou.sum() / num_boxes
         return losses
 
-    # ---- utils ----
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
@@ -445,29 +412,24 @@ class SetCriterion(nn.Module):
     def forward(self, outputs, targets, positive_map):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
 
-        # ---- align positive_map width to the model's token dimension ----
-        logit_dim = outputs_without_aux["pred_logits"].shape[-1]  # includes background
+        # Align positive_map width to pred_logits (including background).
+        logit_dim = outputs_without_aux["pred_logits"].shape[-1]
         if positive_map is None:
             pos_map = None
         else:
             if positive_map.shape[1] != logit_dim:
                 if positive_map.shape[1] > logit_dim:
-                    # Dataset positive_map is wider; truncate overflow
                     pos_map = positive_map[:, :logit_dim]
                 else:
-                    # Add a zero column to account for background
                     pad_cols = logit_dim - positive_map.shape[1]
                     pos_map = torch.nn.functional.pad(positive_map, (0, pad_cols))
             else:
                 pos_map = positive_map
-        # ----------------------------------------------------------------
 
         indices = self.matcher(outputs_without_aux, targets, pos_map)
 
         num_boxes = sum(len(t["labels"]) for t in targets)
-        num_boxes = torch.as_tensor(
-            [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device
-        )
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if dist.is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / dist.get_world_size(), min=1).item()
@@ -489,13 +451,8 @@ class SetCriterion(nn.Module):
         return losses
 
 
-# ---------------------------------------------------------------------------
-# MLP
-# ---------------------------------------------------------------------------
-
 class MLP(nn.Module):
-    """Very simple multi-layer perceptron (also called FFN)."""
-
+    """Simple feed-forward MLP."""
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
@@ -508,11 +465,8 @@ class MLP(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------------
-
 def build(args):
+    """Build model, criteria, and loss weights from args."""
     num_classes = getattr(args, "num_classes", 255)
     device = torch.device(args.device)
 
@@ -529,7 +483,7 @@ def build(args):
         contrastive_loss=args.contrastive_loss,
         contrastive_align_loss=args.contrastive_align_loss,
         cls_scale_mode=getattr(args, "cls_scale_mode", "learnable"),
-        align_scale_mode=getattr(args, "align_scale_mode", "learnable")
+        align_scale_mode=getattr(args, "align_scale_mode", "learnable"),
     )
 
     matcher = build_matcher(args)
@@ -573,7 +527,7 @@ def build(args):
     else:
         contrastive_criterion = None
 
-    # ---- extra optim groups (learnable temperatures) -----------------------
+    # Extra optimizer group for learnable temperature parameters.
     extra = []
     if hasattr(model, "logit_scale_cls") and model.logit_scale_cls is not None and model.logit_scale_cls.requires_grad:
         extra.append(model.logit_scale_cls)

@@ -1,5 +1,14 @@
+"""
+Training/evaluation entrypoint for the mdetr_g detector.
+
+Notes:
+- Supports JSON `--dataset_config` merges into args.
+- In eval/test mode, the model is frozen and no optimizer is constructed.
+- Logs params/metrics/artifacts to MLflow (main process only).
+"""
+
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic cuBLAS
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # deterministic cuBLAS
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys
@@ -20,26 +29,20 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 import mlflow
 
-# ---------------------------------------------------------------------------
-# Project import path (adjusts for 2-level nesting)
-# ---------------------------------------------------------------------------
+# Add repo root to sys.path (file is nested two levels deep).
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
-# ----------------- project utilities -----------------
 import mdetr.util.misc as utils
 from mdetr.engine import train_one_epoch, evaluate
 from mdetr.models import build_model
 from mdetr.models.postprocessors import build_postprocessors
 
-# ----------------- Geo datasets ----------------
 from geo_datasets import build_dataset, get_evaluator
 
 
-# ---------------------------------------------------------------------------
-# Argument parser
-# ---------------------------------------------------------------------------
 def get_args_parser():
+    """Build the CLI ArgumentParser (shared by train/eval/test)."""
     p = argparse.ArgumentParser("mdetr_g detector", add_help=False)
 
     # 1) bookkeeping
@@ -95,7 +98,7 @@ def get_args_parser():
     p.add_argument("--pre_norm",                  action="store_true")
     p.add_argument("--no_pass_pos_and_query",     dest="pass_pos_and_query", action="store_false")
 
-    # Deformable attention (multi-scale always inferred from num_feature_levels)
+    # Deformable attention (multi-scale inferred from num_feature_levels).
     p.add_argument("--num_feature_levels",        type=int, default=3, help="How many backbone stages to use (1-4). Typically 3 (last 3 stages).")
     p.add_argument("--deform_num_points",         type=int, default=4, help="Sampling points per head per level (4 or 8 are common)")
 
@@ -146,6 +149,7 @@ def get_args_parser():
 
 
 def count_params_model(model):
+    """Return (total_params, requires_grad_params)."""
     total = 0
     reqgrad = 0
     for p in model.parameters():
@@ -157,11 +161,7 @@ def count_params_model(model):
 
 
 def report_trainable_by_group(optimizer, verbose: bool = True):
-    """Print a clean table and return a dict with key counts.
-    - totals are per-group (can double-count the same tensor across groups)
-    - *_dedup are union across groups (no double counting)
-    - effective = requires_grad and lr > 0
-    """
+    """Print/return parameter counts per optimizer group (with and without de-dup)."""
     rows = []
     seen = set()
     req_in_opt_dedup = 0
@@ -180,7 +180,6 @@ def report_trainable_by_group(optimizer, verbose: bool = True):
         n_eff = sum(p.numel() for p in params if p.requires_grad and lr > 0.0)
         rows.append((name, n_all, n_req, n_eff, lr, wd))
 
-        # dedup across groups
         for p in params:
             pid = id(p)
             if pid in seen:
@@ -213,10 +212,11 @@ def report_trainable_by_group(optimizer, verbose: bool = True):
 
 def _flatten_metrics_for_mlflow(d, prefix=""):
     """
-    Convert a nested dict of metrics into MLflow-safe flat scalars.
+    Flatten nested metrics into MLflow-safe scalars.
+
     - Scalars pass through.
     - 1-element tensors -> item()
-    - Lists/arrays/tensors with >1 element -> mean/min/max summaries.
+    - Multi-element tensors/arrays/lists -> mean/min/max summaries.
     - Dicts are flattened with key/subkey.
     Non-numeric entries are skipped.
     """
@@ -259,26 +259,23 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
     return flat
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
 def main(args):
-    # ---------------- config overrides ----------------
+    # Dataset-config JSON overrides (best-effort; keys merge into args).
     if args.dataset_config:
         with open(args.dataset_config) as f:
             vars(args).update(json.load(f))
 
-    # Flag alias resolution
+    # Flag alias resolution.
     if getattr(args, "no_deformable_attn", False):
         args.transformer_type = "vanilla"
 
-    # If vanilla transformer, force single feature level (DETR/MDETR style)
+    # Vanilla transformer => single feature level (DETR/MDETR style).
     if getattr(args, "transformer_type", "deformable") == "vanilla":
         args.num_feature_levels = 1
 
     print("==== ARGS ====\n", args)
 
-    # reproducibility
+    # Reproducibility.
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -287,14 +284,12 @@ def main(args):
     except TypeError:
         torch.set_deterministic(True)
 
-    is_main = utils.is_main_process()  # safe logging in DDP/multiprocess
+    is_main = utils.is_main_process()
 
-    # treat eval + test as eval mode
+    # Treat eval + test as eval mode.
     eval_mode = bool(getattr(args, "eval", False)) or bool(getattr(args, "test", False))
 
-    # ----------------- MLFLOW RUN -----------------
     with mlflow.start_run(run_name=args.run_name or None):
-        # log params once (main process only)
         if is_main:
             loggable_args = {}
             for k, v in vars(args).items():
@@ -314,25 +309,22 @@ def main(args):
         if out_dir is not None:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ---------------- model ----------------
         model, criterion, contrastive_criterion, weight_dict = build_model(args)
         model.to(device)
-        args.tokenizer = model.tokenizer  # expose to dataset builder
+        args.tokenizer = model.tokenizer  # used by dataset builder
 
-        # IMPORTANT FIX:
-        # In eval/test mode, freeze EVERYTHING so requires_grad=0 and we don't build an optimizer.
+        # Eval/test: freeze params and skip optimizer construction.
         if eval_mode:
             for p in model.parameters():
                 p.requires_grad_(False)
 
-        # --- EMA: create the shadow copy (frozen, no-grad) ----------------------
+        # EMA shadow copy (always frozen).
         model_ema = deepcopy(model) if getattr(args, "ema", False) else None
         if model_ema is not None:
             for p in model_ema.parameters():
                 p.requires_grad_(False)
             print(f"[EMA] enabled (decay={args.ema_decay}). EMA weights will be used for eval/checkpoints.")
 
-        # ---------------- optimiser ----------------
         optimizer = None
         opt_stats = None
         effective_trainable = 0
@@ -346,7 +338,6 @@ def main(args):
                 if not p.requires_grad:
                     continue
 
-                # keep extra params OUT of base/backbone/text groups
                 if id(p) in extra_param_ids:
                     continue
 
@@ -385,7 +376,7 @@ def main(args):
                     }
                 )
 
-            # Append extra groups LAST (e.g., logit scales)
+            # Append extra groups last (e.g., logit scales).
             already = {id(p) for g in param_groups for p in g["params"]}
             for g in extra_groups:
                 params = [p for p in g.get("params", []) if p is not None and p.requires_grad and id(p) not in already]
@@ -400,7 +391,6 @@ def main(args):
                         }
                     )
 
-            # Normalize optimizer choice
             opt = str(getattr(args, "optimizer", "adamw")).lower()
             if opt == "sgd":
                 optimizer = torch.optim.SGD(param_groups, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
@@ -411,7 +401,7 @@ def main(args):
             else:
                 raise ValueError(f"Unsupported optimizer: {args.optimizer!r}")
 
-        # Accurate counts & audit (after freezing in eval_mode)
+        # Parameter counts (after any eval-mode freezing).
         total_params, reqgrad_params = count_params_model(model)
         if eval_mode:
             print(f"Model params: total={total_params:,}  requires_grad={reqgrad_params:,} (eval_mode: frozen)")
@@ -422,7 +412,6 @@ def main(args):
             mlflow.log_param("n_parameters_total", int(total_params))
             mlflow.log_param("n_parameters_requires_grad", int(reqgrad_params))
 
-        # Only audit optimizer groups in train mode
         if not eval_mode:
             opt_stats = report_trainable_by_group(optimizer, verbose=True)
             missing_from_optimizer = reqgrad_params - opt_stats["in_optimizer_dedup_requires_grad"]
@@ -436,9 +425,8 @@ def main(args):
             if is_main:
                 mlflow.log_param("n_parameters_effective_trainable_lr_gt_0", 0)
 
-        # ---------------- datasets ----------------
+        # Datasets/loaders.
         if eval_mode:
-            # eval/test mode: ONLY build held-out set (100%)
             ds_val = build_dataset(args.dataset_file, "test", args)
             print(f" eval images: {len(ds_val)}")
 
@@ -482,10 +470,8 @@ def main(args):
                 prefetch_factor=1,
             )
 
-        # evaluator & post-process
         postprocessors = build_postprocessors(args, args.dataset_file)
 
-        # ---------------- checkpoints ----------------
         def _maybe_reset_ema_from_model():
             if getattr(args, "ema", False) and (model_ema is not None):
                 model_ema.load_state_dict(model.state_dict(), strict=False)
@@ -517,13 +503,11 @@ def main(args):
 
             print(f"Resumed training from {args.resume}")
 
-        # ---------------- evaluation only ----------------
         EvaluatorCls = get_evaluator(args.dataset_file)
         if eval_mode:
             test_model = model_ema if model_ema is not None else model
             evaluator = EvaluatorCls(ds_val, use_cats=False)
 
-            # Strong no-grad for eval
             with torch.inference_mode():
                 stats = evaluate(
                     test_model,
@@ -539,7 +523,6 @@ def main(args):
             print(json.dumps({f"test_{k}": v for k, v in stats.items()}, indent=2))
             return
 
-        # ---------------- training loop ------------------
         print("==== START TRAINING ====")
         start = time.time()
         best_ap = 0.0
@@ -559,7 +542,7 @@ def main(args):
                 model_ema=(model_ema if getattr(args, "ema", False) else None),
             )
 
-            # checkpoint every epoch (save raw, and EMA weights when enabled)
+            # Save checkpoint every epoch (raw + EMA when enabled).
             if out_dir is not None:
                 ckpt_payload = {
                     "model": model.state_dict(),
@@ -576,7 +559,6 @@ def main(args):
             def make_eval():
                 return EvaluatorCls(ds_val, use_cats=False)
 
-            # validation
             if epoch % args.eval_skip == 0:
                 eval_model = model_ema if (getattr(args, "ema", False) and model_ema is not None) else model
                 val_stats = evaluate(
@@ -596,7 +578,7 @@ def main(args):
                 if curr_ap > best_ap and out_dir is not None:
                     best_ap = curr_ap
                     best_payload = {
-                        "model": model.state_dict(),  # save RAW as best (original MDETR style)
+                        "model": model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "epoch": epoch,
                         "args": args,
@@ -609,7 +591,6 @@ def main(args):
             else:
                 val_stats = {}
 
-            # --- MLflow metrics (main process only) ---
             if is_main:
                 def _to_float(v):
                     if torch.is_tensor(v):
@@ -624,7 +605,6 @@ def main(args):
                 if utils.is_main_process():
                     mlflow.log_metrics(safe_metrics, step=epoch)
 
-            # logging to file
             if out_dir is not None and utils.is_main_process():
                 with (out_dir / "log.txt").open("a") as f:
                     f.write(json.dumps({

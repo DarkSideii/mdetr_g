@@ -1,3 +1,12 @@
+"""
+DOTA dataset loader/preprocessing for MDETR-style training.
+
+Key behaviors:
+- Reads labels/images from S3 and builds a COCO-like view for evaluation.
+- Caches parsed annotations to a local Parquet file for faster startup.
+- Optionally augments caption lists via GPT (best-effort; training should not crash).
+"""
+
 from __future__ import annotations
 
 import csv
@@ -32,12 +41,11 @@ from util.augs import (
     RandomVerticalFlip,
 )
 
-# ─────────────────────────────── setup ────────────────────────────────
+# Global setup.
 load_dotenv()
 random.seed(42)
 
-# If OPENAI_API_KEY is not set, OpenAI() will raise.
-# We don't want to crash in that case—just disable GPT augmentation.
+# OpenAI is optional; if unavailable, caption augmentation is disabled.
 _OPENAI_WARNED = False
 try:
     _openai = OpenAI()
@@ -52,7 +60,7 @@ _S3_CFG = Config(
     read_timeout=60,
 )
 
-# ─────────────────────────────── cache paths ────────────────────────────────
+# Cache paths.
 _THIS_DIR = Path(__file__).resolve().parent
 _PARENT_DIR = _THIS_DIR.parent
 _CACHE_DIR = _PARENT_DIR / "dota_cache"
@@ -61,25 +69,23 @@ _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 ARROW_CACHE = _CACHE_DIR / "dota_annotations.parquet"
 CLASSES_JSON = _CACHE_DIR / "dota_classes.json"
 
-# ─────────────────────────────── DOTA settings ────────────────────────────────
-# Classes per your requirement
+# Dataset settings.
 CLASS_NAMES = ["ship", "plane"]
 CLASS_TO_IDX = {name: i + 1 for i, name in enumerate(CLASS_NAMES)}  # contiguous [1..K]
 IDX_TO_CLASS = {v: k for k, v in CLASS_TO_IDX.items()}
 
-# Caption alignment keywords
+# Caption keyword variants used for token alignment.
 CAPTION_KEYS = {
     "ship": ["ship", "ships"],
     "plane": ["plane", "planes"],
 }
 
-# RP-style split helper
+# Split caption lists of the form "1. ... 2. ...".
 _SPLIT_RE = re.compile(r"\d+\.\s*")
 def _split(txt: str) -> list[str]:
     return [p.strip() for p in _SPLIT_RE.split(txt or "") if p.strip()]
 
-# ───────────────────────── caption augmentation prompt ──────────────────────
-# Keep BLANK exactly as requested.
+# Caption augmentation prompt (kept verbatim).
 _CAP_PROMPT = (
     "Generate NEW sentences that lightly paraphrase the Existing text.\n"
     "\n"
@@ -99,10 +105,10 @@ def _split_sents(txt: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 def _call_gpt(existing: List[str], need: int) -> List[str]:
+    """Generate up to `need` new caption sentences (best-effort)."""
     if need <= 0:
         return []
 
-    # If OpenAI client isn't available, silently skip augmentation.
     global _OPENAI_WARNED
     if _openai is None:
         if not _OPENAI_WARNED:
@@ -110,7 +116,6 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
             print("[DOTA] OpenAI client is None -> skipping GPT caption augmentation.")
         return []
 
-    # RP-style: only a single user message
     prefix = (_CAP_PROMPT + "\n\n") if _CAP_PROMPT else ""
     user_msg = prefix + "Here are the existing sentences:\n" + "\n".join(f"- {s}" for s in existing)
 
@@ -121,14 +126,12 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
             temperature=0.1,
         )
     except Exception as e:
-        # Don't crash training if key is missing / revoked / rate-limited / etc.
         if not _OPENAI_WARNED:
             _OPENAI_WARNED = True
             print(f"[DOTA] GPT caption augmentation failed; continuing without augmentation: {e}")
         return []
 
     raw = resp.choices[0].message.content
-    # Strip numbering/bullets that models sometimes add
     lines = [
         re.compile(r"^\s*(?:\d+\s*[.)-]?\s*|[-\u2013\u2014*\u2022]+\s+)").sub("", l).strip()
         for l in raw.split("\n")
@@ -136,9 +139,9 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
     ]
     return lines[:need]
 
-# ───────────────────── positive map (token alignment) helpers ─────────────────────
+# Token alignment helpers.
 def create_positive_map(tokenized, tokens_positive):
-    """Construct a map such that positive_map[i,j] = True iff box i is associated to token j."""
+    """Build a (boxes x tokens) alignment map in the tokenizer's max_length space."""
     positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
     for j, tok_list in enumerate(tokens_positive):
         for (beg, end) in tok_list:
@@ -169,10 +172,7 @@ def create_positive_map(tokenized, tokens_positive):
     return positive_map / (positive_map.sum(-1)[:, None] + 1e-6)
 
 def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int, str]]:
-    """
-    Case-insensitive char-span finder for any of the candidate strings.
-    Returns (start, end, matched_text) or None.
-    """
+    """Find the first case-insensitive match of any candidate; returns (start, end, matched_text)."""
     if not caption:
         return None
     lower = caption.lower()
@@ -182,7 +182,7 @@ def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int
             return (idx, idx + len(w), caption[idx:idx + len(w)])
     return None
 
-# ────────────────────────────── pyarrow helpers ─────────────────────────────
+# PyArrow helpers for cached annotations.
 def _xyxy_to_xywh(b):
     x1, y1, x2, y2 = b
     return [x1, y1, x2 - x1, y2 - y1]
@@ -255,7 +255,6 @@ def _build_coco_like(ann_dict: Dict[int, Dict]) -> Dict:
     cats = [{"id": cid, "name": IDX_TO_CLASS[cid]} for cid in sorted(IDX_TO_CLASS)]
     return {"images": imgs, "annotations": anns, "categories": cats, "info": {}, "licenses": []}
 
-# ─────────────────────────────── Dataset ────────────────────────────────
 @dataclass
 class _S3Sources:
     bucket: str = "research-geodatasets"
@@ -284,13 +283,7 @@ def _get_arg_int(args, key: str, default: int) -> int:
     return int(v)
 
 def _sources_from_args(args) -> _S3Sources:
-    """
-    ONLY uses the existing hardcoded knobs:
-      - bucket
-      - images_prefix
-      - labels_prefix
-      - csv_key
-    """
+    """Build S3 source config from args (bucket/prefix/key only)."""
     defaults = _S3Sources()
     return _S3Sources(
         bucket=_get_arg_str(args, "bucket", defaults.bucket),
@@ -301,8 +294,7 @@ def _sources_from_args(args) -> _S3Sources:
 
 class DotaModulatedDetection(Dataset):
     """
-    DOTA v2 with TXT HBB labels formatted like: `ship 68 305 86 335`.
-    Pipeline matches RP: splits, augs, GPT top-up, COCO mirror, positive map, etc.
+    DOTA v2 dataset wrapper (S3-backed) with optional caption augmentation and caching.
     """
     def __init__(
         self,
@@ -327,7 +319,7 @@ class DotaModulatedDetection(Dataset):
 
         self.annotations = ann_raw
         self.ids_all = list(ann_raw)
-        self.ids = self.ids_all  
+        self.ids = self.ids_all
 
         self.ids_train, self.ids_val = self._split_groups(ann_raw, val_split_ratio)
         if not self.ids_val:
@@ -335,11 +327,9 @@ class DotaModulatedDetection(Dataset):
             self.ids_val, self.ids_train = self.ids_all[:n], self.ids_all[n:]
 
         if not cache_found:
-            # 1) VAL: explode to 1 sample per caption (NO GPT)
             new_val_ids = self._explode_captions_no_gpt(ann_raw, only_ids=set(self.ids_val))
             self.ids_val = list(self.ids_val) + new_val_ids
 
-            # 2) TRAIN: RP behavior (split + GPT top-up)
             if augment_train:
                 before = set(ann_raw.keys())
                 self._augment_captions_once(ann_raw, only_ids=set(self.ids_train))
@@ -381,10 +371,7 @@ class DotaModulatedDetection(Dataset):
         return self._s3
 
     def _build_annotations(self) -> Dict[int, Dict]:
-        """
-        Scan S3 once, parse TXT HBB -> xyxy bboxes.
-        Use the CSV to tie each <stem> to its S3 image path and caption.
-        """
+        """Scan S3 once and build an annotation dict (TXT HBB -> xyxy) keyed by image_id."""
         s3 = boto3.client("s3", config=_S3_CFG)
 
         csv_rows = list(
@@ -483,6 +470,7 @@ class DotaModulatedDetection(Dataset):
         return ann
 
     def _explode_captions_no_gpt(self, ann: Dict[int, Dict], only_ids=None) -> list[int]:
+        """Split enumerated captions into one-caption-per-sample (no augmentation)."""
         if not ann:
             return []
         ids = list(only_ids) if only_ids is not None else list(ann.keys())
@@ -506,6 +494,7 @@ class DotaModulatedDetection(Dataset):
         return new_ids
 
     def _augment_captions_once(self, ann, only_ids=None):
+        """Top up per-image caption lists via GPT to a target count (best-effort)."""
         rows = [
             {"img_id": k, "stem": v["filename_stem"], "caption": v["caption"]}
             for k, v in ann.items()
@@ -562,6 +551,7 @@ class DotaModulatedDetection(Dataset):
                 nxt += 1
 
     def _split_groups(self, ann_dict, val_ratio):
+        """Group-aware train/val split (keeps stems together)."""
         ids = list(ann_dict)
         stems = [ann_dict[i]["filename_stem"] for i in ids]
         tr, vl = next(
@@ -571,7 +561,7 @@ class DotaModulatedDetection(Dataset):
         )
         return [ids[i] for i in tr], [ids[i] for i in vl]
 
-# ───────────────────────── transforms (same as RP) ─────────────────────────
+# Transforms.
 def _dota_transforms(split: str):
     normalize = T.Compose(
         [
@@ -598,6 +588,7 @@ def _dota_transforms(split: str):
         raise ValueError(split)
 
 class _WrappedDataset(torch.utils.data.Dataset):
+    """Apply transforms on top of a DotaModulatedDetection dataset."""
     def __init__(self, base: DotaModulatedDetection, tfm):
         self.base, self.tfm, self.coco = base, tfm, base.coco
 
@@ -609,15 +600,13 @@ class _WrappedDataset(torch.utils.data.Dataset):
         img, tgt = self.tfm(img, tgt)
         return img, tgt
 
-# ───────────────────── dataset builders ─────────────────────
 def build_dota(set_name: str, args):
     """
-    set_name ∈ {"train", "val", "test"}.
+    Build the requested split dataset.
 
-    Split behavior:
-      - train: uses the train split (split handled inside DotaModulatedDetection)
-      - val:   uses the val split
-      - test:  NO SPLIT. Uses the full dataset (all samples in ids_all)
+    - train: uses ids_train (+ optional augmentation)
+    - val:   uses ids_val
+    - test:  uses ids_all (no split)
     """
     sources = _sources_from_args(args)
 
@@ -639,14 +628,13 @@ def build_dota(set_name: str, args):
         return _WrappedDataset(full, _dota_transforms("val"))
 
     if set_name == "test":
-        # NO split for test: include the whole dataset
         full.ids = full.ids_all
         return _WrappedDataset(full, _dota_transforms("val"))
 
     raise ValueError(set_name)
 
-# ───────────────────── token alignment for DOTA ─────────────────────
 class _ConvertDotaToTarget:
+    """Convert a DOTA record into the MDETR-style target dict (with optional token alignment)."""
     def __init__(self, tokenizer=None, return_tokens: bool = False):
         self.return_tokens = return_tokens
         self.tokenizer = tokenizer

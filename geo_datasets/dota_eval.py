@@ -1,11 +1,17 @@
-# geo_datasets/dota_eval.py
+"""
+COCO-style evaluator helpers for the DOTA dataset.
+
+Adds an optional class-agnostic export path to avoid dropping predictions when labels
+aren't meaningful COCO category ids.
+"""
+
 import numpy as np
 import torch
 from mdetr.datasets.coco_eval import CocoEvaluator, convert_to_xywh
 
 
 def _to_py_int(x):
-    """Safely convert image ids (tensor/np/int) to plain Python int."""
+    """Convert an image id (tensor/np/int/array) to a Python int."""
     if isinstance(x, (int, np.integer)):
         return int(x)
     if torch.is_tensor(x):
@@ -29,32 +35,29 @@ def _num_instances(pred):
 
 class DotaEvaluator(CocoEvaluator):
     """
-    COCO evaluator with a class-agnostic export option.
+    COCO evaluator with optional class-agnostic export.
 
-    If use_cats=False (default here), every detection is exported with category_id=1.
-    This avoids pycocotools silently dropping predictions when labels are token indices
-    (as in MDETR’s token-based classification).
+    When use_cats=False, every detection is exported with category_id=1.
     """
 
     def __init__(self, dataset, use_cats: bool = False, verbose: bool = False):
-        # unwrap Subset → reach the underlying dataset with .coco
+        # Unwrap Subset to reach the dataset with `.coco`.
         while isinstance(dataset, torch.utils.data.Subset):
             dataset = dataset.dataset
         super().__init__(dataset.coco, iou_types=["bbox"], useCats=use_cats)
         self.verbose = verbose
-        self.use_cats = use_cats  # keep a local flag for export logic
+        self.use_cats = use_cats
 
     def update(self, predictions):
-        # Ensure pure Python int keys for pycocotools
+        # pycocotools expects plain int keys.
         fixed = {_to_py_int(img_id): pred for img_id, pred in predictions.items()}
         return super().update(fixed)
 
     def prepare_for_coco_detection(self, predictions):
         """
-        Convert model outputs to COCO json format.
+        Convert model outputs to COCO JSON format.
 
-        When self.use_cats is False, we ignore per-detection 'labels' and force
-        category_id=1 to ensure all detections are evaluated (class-agnostic AP).
+        If self.use_cats is False, ignore per-detection labels and force category_id=1.
         """
         coco_results = []
         for image_id, pred in predictions.items():
@@ -63,27 +66,23 @@ class DotaEvaluator(CocoEvaluator):
 
             image_id = _to_py_int(image_id)
 
-            # boxes come from postprocessor as xyxy tensors → convert to xywh
             if torch.is_tensor(pred["boxes"]):
                 boxes_xywh = convert_to_xywh(pred["boxes"]).cpu().tolist()
             else:
                 boxes_xywh = convert_to_xywh(torch.as_tensor(pred["boxes"])).cpu().tolist()
 
-            # ensure CPU lists
             if torch.is_tensor(pred["scores"]):
                 scores = pred["scores"].detach().cpu().tolist()
             else:
                 scores = list(pred["scores"])
 
             if self.use_cats:
-                # Use provided labels (assumed 0-based in pipeline) and map to COCO 1-based ids
                 if torch.is_tensor(pred.get("labels", None)):
                     labels = pred["labels"].detach().cpu().tolist()
                 else:
                     labels = list(pred.get("labels", []))
-                get_cat = lambda k: int(labels[k]) + 1
+                get_cat = lambda k: int(labels[k]) + 1  # 0-based -> COCO 1-based
             else:
-                # Class-agnostic: force a single category id (1) for all detections
                 get_cat = lambda k: 1
 
             coco_results.extend(

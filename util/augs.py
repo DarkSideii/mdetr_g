@@ -1,3 +1,12 @@
+"""
+Custom image augmentations for PIL images and DETR/MDETR-style targets.
+
+Targets are expected to use:
+- target["boxes"]: torch.Tensor[N, 4] in pixel xyxy
+- target["masks"] (optional): Tensor [N,H,W] or list of PIL masks
+- target["size"] (optional): [H, W] tensor updated when geometry changes
+"""
+
 from __future__ import annotations
 
 import io
@@ -11,9 +20,9 @@ from torchvision.transforms import InterpolationMode
 _EPS = 1e-6
 
 
-# ---------------------- box utilities (xyxy, pixel) ----------------------
+# Box utilities (pixel xyxy).
 def _flip_boxes_h(boxes: torch.Tensor, w: int) -> torch.Tensor:
-    """Horizontal flip boxes within width w."""
+    """Flip xyxy boxes horizontally within an image of width `w`."""
     if boxes.numel() == 0:
         return boxes
     x0, y0, x1, y1 = boxes.unbind(-1)
@@ -24,7 +33,7 @@ def _flip_boxes_h(boxes: torch.Tensor, w: int) -> torch.Tensor:
 
 
 def _flip_boxes_v(boxes: torch.Tensor, h: int) -> torch.Tensor:
-    """Vertical flip boxes within height h."""
+    """Flip xyxy boxes vertically within an image of height `h`."""
     if boxes.numel() == 0:
         return boxes
     x0, y0, x1, y1 = boxes.unbind(-1)
@@ -35,16 +44,12 @@ def _flip_boxes_v(boxes: torch.Tensor, h: int) -> torch.Tensor:
 
 
 def _rot90_boxes(boxes: torch.Tensor, w: int, h: int, k: int) -> torch.Tensor:
-    """
-    Rotate boxes by k * 90° CCW, return axis-aligned AABBs in the rotated image.
-    Coordinates are pixel xyxy.
-    """
+    """Rotate xyxy boxes by `k * 90°` CCW, returning axis-aligned boxes in the rotated frame."""
     k = k % 4
     if k == 0 or boxes.numel() == 0:
         return boxes
 
     x0, y0, x1, y1 = boxes.unbind(-1)
-    # 4 corners per box: [N,4,2]
     pts = torch.stack(
         [
             torch.stack([x0, y0], dim=-1),
@@ -56,15 +61,12 @@ def _rot90_boxes(boxes: torch.Tensor, w: int, h: int, k: int) -> torch.Tensor:
     )
 
     if k == 1:
-        # 90° CCW: (x, y) -> (y, w-1-x)
         xn, yn = pts[..., 1], (w - 1) - pts[..., 0]
         new_w, new_h = h, w
     elif k == 2:
-        # 180°: (x, y) -> (w-1-x, h-1-y)
         xn, yn = (w - 1) - pts[..., 0], (h - 1) - pts[..., 1]
         new_w, new_h = w, h
     else:
-        # 270° CCW: (x, y) -> (h-1-y, x)
         xn, yn = (h - 1) - pts[..., 1], pts[..., 0]
         new_w, new_h = h, w
 
@@ -79,29 +81,31 @@ def _rot90_boxes(boxes: torch.Tensor, w: int, h: int, k: int) -> torch.Tensor:
 
 
 def _update_size(target: Dict[str, Any], new_h: int, new_w: int) -> None:
-    """Update target['size'] while preserving dtype/device if it exists."""
+    """Update target["size"] (if present), preserving dtype/device."""
     if "size" in target:
         old = target["size"]
         target["size"] = torch.as_tensor([new_h, new_w], dtype=old.dtype, device=old.device)
 
 
-# ---------------------- optional mask helpers ----------------------
+# Optional mask helpers.
 def _hflip_masks(m):
+    """Flip masks horizontally (Tensor [N,H,W] or list of PIL masks)."""
     if isinstance(m, torch.Tensor):  # [N,H,W]
         return torch.flip(m, dims=(-1,))
     return [F.hflip(mi) for mi in m]  # list of PIL masks
 
 
 def _vflip_masks(m):
+    """Flip masks vertically (Tensor [N,H,W] or list of PIL masks)."""
     if isinstance(m, torch.Tensor):  # [N,H,W]
         return torch.flip(m, dims=(-2,))
     return [F.vflip(mi) for mi in m]
 
 
 def _rot90_masks(m, k: int):
+    """Rotate masks by `k * 90°` CCW (Tensor [N,H,W] or list of PIL masks)."""
     if isinstance(m, torch.Tensor):  # [N,H,W]
         return torch.rot90(m, k, dims=(-2, -1))
-    # list of PIL masks
     if k == 1:
         op = Image.ROTATE_90
     elif k == 2:
@@ -111,7 +115,7 @@ def _rot90_masks(m, k: int):
     return [mi.transpose(op) for mi in m]
 
 
-# ------------------------------ transforms ------------------------------
+# Transforms.
 class RandomVerticalFlip:
     """Flip image (and boxes/masks) vertically with probability p."""
 
@@ -124,13 +128,13 @@ class RandomVerticalFlip:
             img = F.vflip(img)
             if "boxes" in target:
                 target["boxes"] = _flip_boxes_v(target["boxes"], h)
-            if "masks" in target:  # optional
+            if "masks" in target:
                 target["masks"] = _vflip_masks(target["masks"])
         return img, target
 
 
 class RandomRotate90:
-    """Rotate by a random choice of {90, 180, 270} deg CCW with probability p."""
+    """Rotate by a random choice of {90, 180, 270} degrees CCW with probability p."""
 
     def __init__(self, prob: float = 0.5):
         self.prob = prob
@@ -139,7 +143,7 @@ class RandomRotate90:
         if random.random() >= self.prob:
             return img, target
 
-        k = random.choice([1, 2, 3])  # steps of 90° CCW
+        k = random.choice([1, 2, 3])
         w, h = img.size
 
         if k == 1:
@@ -151,17 +155,16 @@ class RandomRotate90:
 
         if "boxes" in target and target["boxes"].numel():
             target["boxes"] = _rot90_boxes(target["boxes"], w, h, k)
-        if "masks" in target:  # optional
+        if "masks" in target:
             target["masks"] = _rot90_masks(target["masks"], k)
 
-        # Update *current* size; leave orig_size alone.
         new_w, new_h = (h, w) if k in (1, 3) else (w, h)
         _update_size(target, new_h, new_w)
         return img, target
 
 
 class RandomJPEG:
-    """Re-encode JPEG to add compression artifacts."""
+    """Re-encode the image as JPEG to introduce compression artifacts."""
 
     def __init__(self, prob: float = 0.3, qmin: int = 60, qmax: int = 95):
         self.prob, self.qmin, self.qmax = prob, qmin, qmax
@@ -191,7 +194,7 @@ class RandomGaussianBlur:
 
 
 class RandomColorJitter:
-    """Lightweight color jitter that keeps geometry intact."""
+    """Lightweight color jitter (no geometry changes)."""
 
     def __init__(
         self,
@@ -218,13 +221,13 @@ class RandomColorJitter:
 
 
 def _get_inverse_affine_matrix(center, angle, translate, scale, shear):
-    # Helper function to create the inverse matrix for box transformations
+    """Wrapper for torchvision's internal inverse-affine matrix helper."""
     from torchvision.transforms.functional import _get_inverse_affine_matrix as get_matrix
     return get_matrix(center, angle, translate, scale, shear)
 
 
 class RandomAffine:
-    """Applies random affine transformations (shear/rotation) to image and boxes."""
+    """Apply random affine (rotation + shear) to the image and axis-aligned boxes."""
 
     def __init__(self, prob: float = 0.5, degrees: float = 0, shear: float = 10):
         self.prob = prob
@@ -236,14 +239,12 @@ class RandomAffine:
             return img, target
 
         w, h = img.size
-        center = (w * 0.5, h * 0.5)  # ← define once, reuse for image + boxes
+        center = (w * 0.5, h * 0.5)
 
-        # random params
         angle   = random.uniform(-self.degrees, self.degrees)
         shear_x = random.uniform(-self.shear,   self.shear)
         shear_y = random.uniform(-self.shear,   self.shear)
 
-        # 1) transform image
         img = F.affine(
             img,
             angle=angle,
@@ -254,12 +255,10 @@ class RandomAffine:
             center=center,
         )
 
-        # 2) transform boxes
         if "boxes" in target and target["boxes"].numel() > 0:
             boxes = target["boxes"]
             dtype, device = boxes.dtype, boxes.device
 
-            # inverse matrix from torchvision (maps output->input)
             inv_flat = _get_inverse_affine_matrix(
                 center=center,
                 angle=angle,
@@ -270,7 +269,6 @@ class RandomAffine:
             inv_2x3 = torch.tensor(inv_flat, dtype=dtype, device=device).view(2, 3)
             inv_3x3 = torch.vstack([inv_2x3, torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device)])
 
-            # forward matrix (input->output)
             fwd_3x3 = torch.linalg.inv(inv_3x3)
             M = fwd_3x3[:2, :]  # 2x3
 
@@ -284,7 +282,6 @@ class RandomAffine:
             corners_h = torch.cat([corners, ones], dim=-1)            # (N,4,3)
             new = torch.einsum('ij,nkj->nki', M, corners_h)          # (N,4,2)
 
-            # axis-aligned AABB, clamp to image
             xmin = new[..., 0].min(dim=1).values.clamp(0, w - 1e-6)
             xmax = new[..., 0].max(dim=1).values.clamp(0, w - 1e-6)
             ymin = new[..., 1].min(dim=1).values.clamp(0, h - 1e-6)
@@ -295,7 +292,7 @@ class RandomAffine:
 
 
 class RandomGaussianNoise:
-    """Adds Gaussian noise to a PIL image."""
+    """Add i.i.d. Gaussian noise (in RGB space) to a PIL image."""
 
     def __init__(self, prob: float = 0.5, std: float = 15.0):
         self.prob = prob
@@ -305,16 +302,9 @@ class RandomGaussianNoise:
         if random.random() >= self.prob:
             return img, target
 
-        # Convert PIL image to numpy array to perform numerical operations
         img_arr = np.array(img)
-
-        # Generate Gaussian noise with a mean of 0 and the specified standard deviation
         noise = np.random.normal(0, self.std, img_arr.shape)
-
-        # Add noise to the image and clip the values to the valid [0, 255] range
         noisy_img_arr = np.clip(img_arr + noise, 0, 255).astype(np.uint8)
-
-        # Convert the noisy numpy array back to a PIL image
         noisy_img = Image.fromarray(noisy_img_arr)
 
         return noisy_img, target

@@ -9,6 +9,7 @@ from mdetr.util.dist import is_main_process as _is_main_process
 
 
 def get_sha() -> str:
+    """Return a short git status string (sha, dirty/clean, branch) if available."""
     cwd = os.path.dirname(os.path.abspath(__file__))
 
     def _run(command):
@@ -32,15 +33,15 @@ def get_sha() -> str:
 
 
 def collate_fn(do_round, batch):
+    """Collate (image, target) pairs into a NestedTensor batch plus target list."""
     batch = list(zip(*batch))
     final_batch: Dict[str, Any] = {}
 
     final_batch["samples"] = NestedTensor.from_tensor_list(batch[0], do_round)
     final_batch["targets"] = batch[1]
 
-    # Positive map (train)
+    # Collapse per-sample positive maps across the batch (no padding on box dimension).
     if "positive_map" in batch[1][0]:
-        # Since elements have different #boxes, collapse the batch-dim (no padding).
         max_len = max(v["positive_map"].shape[1] for v in batch[1])
         nb_boxes = sum(v["positive_map"].shape[0] for v in batch[1])
 
@@ -54,7 +55,6 @@ def collate_fn(do_round, batch):
 
         final_batch["positive_map"] = batched_pos_map.float()
 
-    # Positive map (eval)
     if "positive_map_eval" in batch[1][0]:
         max_len = max(v["positive_map_eval"].shape[1] for v in batch[1])
         nb_boxes = sum(v["positive_map_eval"].shape[0] for v in batch[1])
@@ -69,7 +69,7 @@ def collate_fn(do_round, batch):
 
         final_batch["positive_map_eval"] = batched_pos_map.float()
 
-    # Answers (for QA-style datasets)
+    # Answers (QA-style datasets).
     if "answer" in batch[1][0] or "answer_type" in batch[1][0]:
         answers: Dict[str, Tensor] = {}
         for f in batch[1][0].keys():
@@ -82,6 +82,7 @@ def collate_fn(do_round, batch):
 
 
 class NestedTensor:
+    """Tensor + mask wrapper used by the model (mask is True for padding)."""
     def __init__(self, tensors: Tensor, mask: Optional[Tensor]):
         self.tensors = tensors
         self.mask = mask
@@ -96,17 +97,15 @@ class NestedTensor:
 
     @classmethod
     def from_tensor_list(cls, tensor_list: List[Tensor], do_round: bool = False):
-        # Only 3D images supported: [C,H,W]
+        """Pad a list of [C,H,W] tensors into a batch and create a padding mask."""
         if tensor_list[0].ndim != 3:
             raise ValueError("not supported")
 
-        # Build batch tensor & mask
         max_size = tuple(max(s) for s in zip(*[img.shape for img in tensor_list]))
         batch_shape = (len(tensor_list),) + max_size
         b, c, h, w = batch_shape
 
         if do_round:
-            # Round to multiple-of-128 to avoid FPN rounding issues
             p = 128
             h = h if h % p == 0 else (h // p + 1) * p
             w = w if w % p == 0 else (w // p + 1) * p
@@ -134,39 +133,23 @@ def interpolate(
     mode: str = "nearest",
     align_corners: Optional[bool] = None,
 ) -> Tensor:
-    """
-    Equivalent to nn.functional.interpolate, but with support for empty channel sizes.
-    """
+    """nn.functional.interpolate with support for empty batch/channel dimensions."""
     if input.numel() > 0:
         return torch.nn.functional.interpolate(input, size, scale_factor, mode, align_corners)
 
     assert input.shape[0] != 0 or input.shape[1] != 0, "At least one of the two first dimensions must be non zero"
 
     if input.shape[1] == 0:
-        # Pytorch doesn't support null dimension on the channel dimension,
-        # so we transpose to fake a null batch dim
+        # Work around PyTorch not supporting empty channel dimension.
         return torch.nn.functional.interpolate(
             input.transpose(0, 1), size, scale_factor, mode, align_corners
         ).transpose(0, 1)
 
-    # empty batch dimension is now supported in pytorch
     return torch.nn.functional.interpolate(input, size, scale_factor, mode, align_corners)
 
 
-# def targets_to(targets: List[Dict[str, Any]], device):
-#     """Moves the target dicts to the given device."""
-#     excluded_keys = [
-#         "questionId", "tokens_positive", "tokens", "dataset_name", "sentence_id",
-#         "original_img_id", "nb_eval", "task_id", "original_id",
-#     ]
-#     return [
-#         {k: v.to(device) if k not in excluded_keys else v for k, v in t.items() if k != "caption"}
-#         for t in targets
-#     ]
-
-
 def targets_to(targets: List[Dict[str, Any]], device) -> List[Dict[str, Any]]:
-    """Moves all tensors in a list of target dicts to the given device."""
+    """Move all tensor values in each target dict to `device`."""
     return [
         {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()}
         for t in targets
@@ -174,8 +157,5 @@ def targets_to(targets: List[Dict[str, Any]], device) -> List[Dict[str, Any]]:
 
 
 def is_main_process() -> bool:
-    """
-    True if this is the main process.
-    In single-GPU (no torch.distributed) this is always True.
-    """
+    """True if this is the main process (always True without torch.distributed)."""
     return _is_main_process()

@@ -1,12 +1,10 @@
-# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
-COCO evaluator that works in distributed mode.
+Distributed COCO evaluator utilities.
 
-Mostly copy-paste from https://github.com/pytorch/vision/blob/edfd5a7/references/detection/coco_eval.py
-The difference is that there is less copy-pasting from pycocotools
-in the end of the file, as python3 can suppress prints with contextlib
+Wraps pycocotools COCOeval and provides synchronization helpers for multi-process
+evaluation.
 """
+
 import contextlib
 import copy
 import os
@@ -21,6 +19,7 @@ from mdetr.util.dist import all_gather
 
 
 class CocoEvaluator(object):
+    """Run COCOeval per IoU type and synchronize results across processes."""
     def __init__(self, coco_gt, iou_types, useCats=False):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
@@ -43,7 +42,7 @@ class CocoEvaluator(object):
         for iou_type in self.iou_types:
             results = self.prepare(predictions, iou_type)
 
-            # suppress pycocotools prints
+            # Suppress pycocotools output during COCO.loadRes().
             with open(os.devnull, "w") as devnull:
                 with contextlib.redirect_stdout(devnull):
                     coco_dt = COCO.loadRes(self.coco_gt, results) if results else COCO()
@@ -58,20 +57,24 @@ class CocoEvaluator(object):
             self.eval_imgs[iou_type].append(eval_imgs)
 
     def synchronize_between_processes(self):
+        """Merge per-process eval results into a single COCOeval state."""
         for iou_type in self.iou_types:
             self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
             create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
 
     def accumulate(self):
+        """Accumulate the COCOeval statistics."""
         for coco_eval in self.coco_eval.values():
             coco_eval.accumulate()
 
     def summarize(self):
+        """Print COCOeval summaries per IoU type."""
         for iou_type, coco_eval in self.coco_eval.items():
             print("IoU metric: {}".format(iou_type))
             coco_eval.summarize()
 
     def prepare(self, predictions, iou_type):
+        """Convert predictions into COCO JSON format for the given iou_type."""
         if iou_type == "bbox":
             return self.prepare_for_coco_detection(predictions)
         elif iou_type == "segm":
@@ -82,6 +85,7 @@ class CocoEvaluator(object):
             raise ValueError("Unknown iou type {}".format(iou_type))
 
     def prepare_for_coco_detection(self, predictions):
+        """Format bbox predictions as COCO detection results."""
         coco_results = []
         for original_id, prediction in predictions.items():
             if len(prediction) == 0:
@@ -106,6 +110,7 @@ class CocoEvaluator(object):
         return coco_results
 
     def prepare_for_coco_segmentation(self, predictions):
+        """Format mask predictions as COCO segmentation results."""
         coco_results = []
         for original_id, prediction in predictions.items():
             if len(prediction) == 0:
@@ -140,6 +145,7 @@ class CocoEvaluator(object):
         return coco_results
 
     def prepare_for_coco_keypoint(self, predictions):
+        """Format keypoint predictions as COCO keypoint results."""
         coco_results = []
         for original_id, prediction in predictions.items():
             if len(prediction) == 0:
@@ -167,11 +173,13 @@ class CocoEvaluator(object):
 
 
 def convert_to_xywh(boxes):
+    """Convert xyxy boxes to xywh boxes."""
     xmin, ymin, xmax, ymax = boxes.unbind(1)
     return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
 
 
 def merge(img_ids, eval_imgs):
+    """All-gather and merge img_ids/eval_imgs across processes."""
     all_img_ids = all_gather(img_ids)
     all_eval_imgs = all_gather(eval_imgs)
 
@@ -186,7 +194,6 @@ def merge(img_ids, eval_imgs):
     merged_img_ids = np.array(merged_img_ids)
     merged_eval_imgs = np.concatenate(merged_eval_imgs, 2)
 
-    # keep only unique (and in sorted order) images
     merged_img_ids, idx = np.unique(merged_img_ids, return_index=True)
     merged_eval_imgs = merged_eval_imgs[..., idx]
 
@@ -194,6 +201,7 @@ def merge(img_ids, eval_imgs):
 
 
 def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
+    """Populate a COCOeval instance with merged per-image evaluation results."""
     img_ids, eval_imgs = merge(img_ids, eval_imgs)
     img_ids = list(img_ids)
     eval_imgs = list(eval_imgs.flatten())
@@ -203,25 +211,13 @@ def create_common_coco_eval(coco_eval, img_ids, eval_imgs):
     coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
 
 
-#################################################################
-# From pycocotools, just removed the prints and fixed
-# a Python3 bug about unicode not defined
-#################################################################
-
-
 def evaluate(self):
-    """
-    Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
-    :return: None
-    """
-    # tic = time.time()
-    # print('Running per image evaluation...')
+    """Run per-image COCOeval evaluation and return (imgIds, evalImgs array)."""
     p = self.params
-    # add backward compatibility if useSegm is specified in params
     if p.useSegm is not None:
         p.iouType = "segm" if p.useSegm == 1 else "bbox"
         print("useSegm (deprecated) is not None. Running {} evaluation".format(p.iouType))
-    # print('Evaluate annotation type *{}*'.format(p.iouType))
+
     p.imgIds = list(np.unique(p.imgIds))
     if p.useCats:
         p.catIds = list(np.unique(p.catIds))
@@ -229,7 +225,6 @@ def evaluate(self):
     self.params = p
 
     self._prepare()
-    # loop through images, area range, max detection number
     catIds = p.catIds if p.useCats else [-1]
 
     if p.iouType == "segm" or p.iouType == "bbox":
@@ -243,14 +238,6 @@ def evaluate(self):
     evalImgs = [
         evaluateImg(imgId, catId, areaRng, maxDet) for catId in catIds for areaRng in p.areaRng for imgId in p.imgIds
     ]
-    # this is NOT in the pycocotools code, but could be done outside
     evalImgs = np.asarray(evalImgs).reshape(len(catIds), len(p.areaRng), len(p.imgIds))
     self._paramsEval = copy.deepcopy(self.params)
-    # toc = time.time()
-    # print('DONE (t={:0.2f}s).'.format(toc-tic))
     return p.imgIds, evalImgs
-
-
-#################################################################
-# end of straight copy from pycocotools, just removing the prints
-#################################################################

@@ -1,11 +1,14 @@
 import copy
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import AutoModel, AutoTokenizer
+
 from .transformer_vanilla import VanillaTransformer
+
+
 # ---- Try to import the CUDA op from MMCV -----------------------------------
 _HAS_MMCV = False
 try:
@@ -41,7 +44,6 @@ class _MSDeformAttnWrapper(nn.Module):
                 "Install a wheel that matches your Torch/CUDA."
             )
 
-        # Prefer batch_first=True when supported (MMCV >= ~1.5/2.0)
         mod = None
         try:
             mod = _MMCV_MSDA(
@@ -49,11 +51,10 @@ class _MSDeformAttnWrapper(nn.Module):
                 num_heads=n_heads,
                 num_levels=n_levels,
                 num_points=n_points,
-                batch_first=True,  # <--- force batch-first when available
+                batch_first=True,
             )
             self.batch_first = True
         except TypeError:
-            # Older builds: no named args / no batch_first flag
             mod = _MMCV_MSDA(d_model, n_heads, n_levels, n_points)
             self.batch_first = getattr(mod, "batch_first", False)
 
@@ -62,13 +63,12 @@ class _MSDeformAttnWrapper(nn.Module):
     def forward(
         self,
         query: Tensor,  # [S_q,B,C]
-        reference_points: Tensor,  # [B,S_q,L,2] or [B,Q,L,2]
+        reference_points: Tensor,  # [B,S_q,L,2]
         value: Tensor,  # [S_v,B,C]
-        spatial_shapes: Tensor,  # [L,2] (long)
-        level_start_index: Tensor,  # [L] (long)
+        spatial_shapes: Tensor,  # [L,2]
+        level_start_index: Tensor,  # [L]
         key_padding_mask: Optional[Tensor] = None,  # [B,S_v]
     ) -> Tensor:
-        # Convert to expected layout
         if self.batch_first:
             q = query.transpose(0, 1).contiguous()  # [B,S_q,C]
             v = value.transpose(0, 1).contiguous()  # [B,S_v,C]
@@ -86,7 +86,6 @@ class _MSDeformAttnWrapper(nn.Module):
         reference_points = reference_points.to(device=v.device, dtype=v.dtype)
         reference_points = reference_points.clamp(1e-5, 1 - 1e-5).contiguous()
 
-        # preflight check uses the correct length dim
         s_total = int((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum().item())
         if v.shape[len_dim] != s_total:
             raise RuntimeError(
@@ -94,7 +93,6 @@ class _MSDeformAttnWrapper(nn.Module):
                 f"spatial_shapes={spatial_shapes.tolist()}, batch_first={self.batch_first}"
             )
 
-        # Call the op (newer MMCV supports kwargs)
         try:
             out = self.mod(
                 query=q,
@@ -105,15 +103,11 @@ class _MSDeformAttnWrapper(nn.Module):
                 key_padding_mask=key_padding_mask,
             )
         except TypeError:
-            # Very old builds expect positional args, batch_first=False
-            # (and we already prepared q/v accordingly)
             out = self.mod(q, reference_points, v, spatial_shapes, level_start_index, key_padding_mask)
 
-        # Back to [S_q,B,C]
         return out.transpose(0, 1).contiguous() if self.batch_first else out.contiguous()
 
 
-# ---------------------------- helpers ---------------------------------------
 class FeatureResizer(nn.Module):
     """Linear + LN + Dropout to map text hidden size -> d_model."""
 
@@ -146,16 +140,14 @@ def _get_activation_fn(activation):
 
 
 def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    # Clamp away from 0/1 to avoid ±inf, NaNs under AMP/FP16
     x = x.clamp(min=eps, max=1 - eps)
     return torch.log(x / (1 - x))
 
 
 def _get_valid_ratio(mask: Tensor) -> Tensor:
-    # mask: [B,H,W], True = padded
     B, H, W = mask.shape
-    valid_H = (~mask).any(dim=2).sum(dim=1)  # rows with at least one valid pixel
-    valid_W = (~mask).any(dim=1).sum(dim=1)  # cols with at least one valid pixel
+    valid_H = (~mask).any(dim=2).sum(dim=1)
+    valid_W = (~mask).any(dim=1).sum(dim=1)
     ratio_h = valid_H.float() / H
     ratio_w = valid_W.float() / W
     return torch.stack([ratio_w, ratio_h], dim=-1)  # [B,2]
@@ -179,7 +171,6 @@ def _get_reference_points(spatial_shapes: Tensor, valid_ratios: Tensor, device):
     return reference_points.contiguous()
 
 
-# --------------------------- encoder / decoder -------------------------------
 class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, d_ffn, dropout, n_levels, n_heads, n_points, activation="relu"):
         super().__init__()
@@ -195,16 +186,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
         self.act = _get_activation_fn(activation)
 
-    def forward(
-        self,
-        src: Tensor,
-        pos: Tensor,
-        reference_points: Tensor,
-        spatial_shapes: Tensor,
-        level_start_index: Tensor,
-        padding_mask: Optional[Tensor],
-    ):
-        # src, pos: [S_total,B,C]; reference_points: [B,S_total,L,2]
+    def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, padding_mask):
         q = k = src + pos
         src2 = self.self_attn(q, reference_points, src, spatial_shapes, level_start_index, padding_mask)
         src = src + self.dropout1(src2)
@@ -242,23 +224,19 @@ class DeformableTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.use_text_cross = use_text_cross_attn
 
-        # (1) self-attn over queries
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=False)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
-        # (2) deformable cross-attn to image memory
         self.cross_attn_img = _MSDeformAttnWrapper(d_model, n_levels, n_heads, n_points)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
-        # (3) cross-attn to text memory (standard MHA)
         if self.use_text_cross:
             self.cross_attn_txt = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=False)
             self.dropout_txt = nn.Dropout(dropout)
             self.norm_txt = nn.LayerNorm(d_model)
 
-        # FFN
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.dropout3 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ffn, d_model)
@@ -278,20 +256,17 @@ class DeformableTransformerDecoderLayer(nn.Module):
         memory_key_padding_mask: Optional[Tensor],  # [B,S_total]
         text_memory: Optional[Tensor],  # [T,B,C]
         text_key_padding_mask: Optional[Tensor],  # [B,T]
-        pos: Optional[Tensor],  # [S_total,B,C]
+        pos: Optional[Tensor],
     ):
-        # 1) query self-attn
         q = k = tgt + query_pos
-        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=None, key_padding_mask=None)[0]  # [Q,B,C]
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=None, key_padding_mask=None)[0]
         tgt = self.norm1(tgt + self.dropout1(tgt2))
 
-        # 2) deformable cross-attn on image memory
         tgt2 = self.cross_attn_img(
             tgt + query_pos, reference_points, memory, spatial_shapes, level_start_index, memory_key_padding_mask
         )
         tgt = self.norm2(tgt + self.dropout2(tgt2))
 
-        # 3) (optional) cross-attn to text
         if self.use_text_cross and (text_memory is not None):
             tgt2 = self.cross_attn_txt(
                 query=tgt + query_pos,
@@ -302,7 +277,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
             )[0]
             tgt = self.norm_txt(tgt + self.dropout_txt(tgt2))
 
-        # 4) FFN
         ff = self.linear2(self.dropout3(self.act(self.linear1(tgt))))
         tgt = self.norm4(tgt + self.dropout4(ff))
         return tgt
@@ -314,14 +288,14 @@ class DeformableTransformerDecoder(nn.Module):
         self.layers = _get_clones(layer, num_layers)
         self.num_layers = num_layers
         self.norm = nn.LayerNorm(d_model)
+
         self.refine_head = _get_clones(nn.Linear(d_model, 2), num_layers)
         self._init_refine_head()
-        self.ref_point_head = nn.Linear(d_model, 2)  # predict 2D ref points from queries
+        self.ref_point_head = nn.Linear(d_model, 2)
         self.n_levels = n_levels
         self.return_intermediate = True
 
     def _init_refine_head(self):
-        # zero-init so initial deltas are ~0 and refs don't jump early
         for lin in self.refine_head:
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
@@ -346,7 +320,6 @@ class DeformableTransformerDecoder(nn.Module):
         ref_points_norm = ref_points_norm.permute(1, 0, 2).contiguous()  # [B,Q,2]
         ref_points_norm = ref_points_norm.clamp(1e-5, 1 - 1e-5)
 
-        # keep a clamped, normalized copy
         ref_points = (ref_points_norm[:, :, None, :] * valid_ratios[:, None, :, :]).contiguous()
 
         for lid, layer in enumerate(self.layers):
@@ -364,31 +337,17 @@ class DeformableTransformerDecoder(nn.Module):
             )
             intermediate.append(self.norm(output))
 
-            if hasattr(self, "refine_head"):
-                delta_xy = self.refine_head[lid](output)  # [Q,B,2]
-                delta_xy = delta_xy.permute(1, 0, 2).contiguous()  # [B,Q,2]
+            delta_xy = self.refine_head[lid](output)  # [Q,B,2]
+            delta_xy = delta_xy.permute(1, 0, 2).contiguous()  # [B,Q,2]
 
-                # Update normalized ref points (no level dim here)
-                ref_points_norm = (
-                    inverse_sigmoid(ref_points_norm) + delta_xy  # [B,Q,2]
-                ).sigmoid().clamp(1e-5, 1 - 1e-5)  # keep it [B,Q,2]
-
-                # Rebuild per-level reference points for MSDA
-                ref_points = (
-                    ref_points_norm[:, :, None, :] * valid_ratios[:, None, :, :]
-                ).contiguous()  # [B,Q,L,2]
+            ref_points_norm = (inverse_sigmoid(ref_points_norm) + delta_xy).sigmoid().clamp(1e-5, 1 - 1e-5)
+            ref_points = (ref_points_norm[:, :, None, :] * valid_ratios[:, None, :, :]).contiguous()
 
         return torch.stack(intermediate)  # [L,Q,B,C]
 
 
-# ------------------------------ main module ---------------------------------
 class Transformer(nn.Module):
-    """
-    Deformable Transformer for MDETR:
-    - Encoder: MSDeformAttn over multi-scale image features
-    - Decoder: Self-Attn → MSDeformAttn (image) → (optional) MHA (text) → FFN
-    - Text is encoded with any HF encoder (RoBERTa/BERT/MiniLM), then resized to d_model.
-    """
+    """Deformable Transformer used by your MDETR."""
 
     def __init__(
         self,
@@ -411,11 +370,9 @@ class Transformer(nn.Module):
     ):
         super().__init__()
 
-        # Resolve known alias/casing for sentence-transformers MiniLM
         if text_encoder_type.lower().endswith("sentence-transformers/all-minilm-l6-v2"):
             text_encoder_type = "sentence-transformers/all-MiniLM-L6-v2"
 
-        # text encoder (generic HF)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type, use_fast=True)
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         if freeze_text_encoder:
@@ -430,7 +387,6 @@ class Transformer(nn.Module):
             dropout=self.expander_dropout,
         )
 
-        # deformable encoder/decoder
         self.multi_scale = True
         self.num_feature_levels = num_feature_levels
         self.nhead = nhead
@@ -464,9 +420,8 @@ class Transformer(nn.Module):
         self.decoder = DeformableTransformerDecoder(dec_layer, num_decoder_layers, d_model, num_feature_levels)
 
         self.CLS = nn.Embedding(1, d_model) if contrastive_loss else None
-        self.pass_pos_and_query = pass_pos_and_query  # not used internally; preserved for interface
+        self.pass_pos_and_query = pass_pos_and_query  # kept for interface parity
 
-    # ---------------------------- encode & cache -----------------------------
     def _flatten_multi_level(self, srcs: List[Tensor], poss: List[Tensor], masks: List[Tensor]):
         if not (len(srcs) == len(poss) == len(masks)):
             raise RuntimeError(
@@ -510,7 +465,6 @@ class Transformer(nn.Module):
         pos_flatten = torch.cat(pos_flatten, dim=1).transpose(0, 1).contiguous()  # [S_total, B, C]
         mask_flatten = torch.cat(mask_flatten, dim=1).contiguous()  # [B, S_total]
 
-        # --- Invariants (catch exactly your crash early & clearly)
         S_total = int((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum().item())
         assert src_flatten.shape[0] == S_total, (
             f"S_total mismatch: spatial sum={S_total}, but src_flatten={src_flatten.shape[0]}"
@@ -535,14 +489,13 @@ class Transformer(nn.Module):
         level_start_index: Optional[Tensor] = None,
         valid_ratios: Optional[Tensor] = None,
     ):
-        # ------------------------ 1) ENCODE & CACHE -------------------------
         if encode_and_save:
             assert isinstance(src, (list, tuple)), (
                 "Deformable transformer expects a *list* of multi-scale feature maps for 'src'"
             )
             device = src[0].device
 
-            # Encode the text if needed
+            # Encode text
             if isinstance(text[0], str):
                 tokenized = self.tokenizer.batch_encode_plus(
                     text,
@@ -557,89 +510,69 @@ class Transformer(nn.Module):
                 text_mem = last_hidden.transpose(0, 1)  # [T,B,H]
                 text_attn_mask = tokenized.attention_mask.ne(1).bool()  # [B,T] True=pad
                 text_mem_resized = self.resizer(text_mem)  # [T,B,C]
-
-                # pooled text for contrastive, robust across models (mean pool)
                 text_pooled = _mean_pool(last_hidden, tokenized.attention_mask)  # [B,H]
             else:
-                # The text is already encoded; expect (mask, resized_mem, tokenized)
                 text_attn_mask, text_mem_resized, tokenized = text
                 text_mem = text_mem_resized
+                text_pooled = text_mem_resized.transpose(0, 1).mean(1)  # [B,C]
 
-                # if we rely on contrastive loss, fall back to mean of resized (no mask info)
-                text_pooled = text_mem_resized.transpose(0, 1).mean(1)  # [B,C] (approx)
-
-            L_src, L_pos, L_msk = len(src), len(pos_embed), len(mask)
-            if not (L_src == L_pos == L_msk):
+            if not (len(src) == len(pos_embed) == len(mask)):
                 raise RuntimeError(
-                    f"Level count mismatch: src={L_src}, pos={L_pos}, mask={L_msk}. "
-                    "All must match num_feature_levels."
+                    f"Level count mismatch: src={len(src)}, pos={len(pos_embed)}, mask={len(mask)}."
                 )
 
-            # image multi-level flatten
-            (
-                src_flat,
-                pos_flat,
-                mask_flat,
-                spatial_shapes,
-                level_start_index,
-                valid_ratios,
-            ) = self._flatten_multi_level(src, pos_embed, mask)
+            src_flat, pos_flat, mask_flat, spatial_shapes, level_start_index, valid_ratios = self._flatten_multi_level(
+                src, pos_embed, mask
+            )
 
-            # encoder reference points
-            ref_pts = _get_reference_points(spatial_shapes, valid_ratios, src_flat.device)  # [B,S_total,L,2]
+            ref_pts = _get_reference_points(spatial_shapes, valid_ratios, src_flat.device)
+            memory = self.encoder(src_flat, pos_flat, ref_pts, spatial_shapes, level_start_index, mask_flat)
 
-            # encode
-            memory = self.encoder(src_flat, pos_flat, ref_pts, spatial_shapes, level_start_index, mask_flat)  # [S,B,C]
-
-            # pooled image embedding (for contrastive, if used)
             if self.CLS is not None:
-                # masked mean over valid tokens
                 img_pooled_op = (memory * (~mask_flat).float().transpose(0, 1)[:, :, None]).sum(0)
                 denom = (~mask_flat).float().sum(1).clamp(min=1.0)[:, None]
-                img_pooled_op = img_pooled_op / denom  # [B, C]
+                img_pooled_op = img_pooled_op / denom
             else:
                 img_pooled_op = None
 
             return {
-                "text_memory_resized": text_mem_resized,  # [T,B,C]
-                "text_memory": text_mem_resized,  # [T,B,C]
-                "img_memory": memory,  # [S_total,B,C]
-                "mask": mask_flat,  # [B,S_total]
-                "pos_embed": pos_flat,  # [S_total,B,C]
-                "query_embed": query_embed.unsqueeze(1).repeat(1, memory.shape[1], 1),  # [Q,B,C]
-                "text_attention_mask": text_attn_mask,  # [B,T]
-                "spatial_shapes": spatial_shapes,  # [L,2]
-                "level_start_index": level_start_index,  # [L]
-                "valid_ratios": valid_ratios,  # [B,L,2]
+                "text_memory_resized": text_mem_resized,
+                "text_memory": text_mem_resized,
+                "img_memory": memory,
+                "mask": mask_flat,
+                "pos_embed": pos_flat,
+                "query_embed": query_embed.unsqueeze(1).repeat(1, memory.shape[1], 1),
+                "text_attention_mask": text_attn_mask,
+                "spatial_shapes": spatial_shapes,
+                "level_start_index": level_start_index,
+                "valid_ratios": valid_ratios,
                 "tokenized": tokenized,
                 "text_pooled_op": (text_pooled if self.CLS is not None else None),
                 "img_pooled_op": (img_pooled_op if self.CLS is not None else None),
             }
 
-        # --------------------------- 2) DECODE -------------------------------
-        else:
-            assert img_memory is not None and text_memory is not None
-            assert (spatial_shapes is not None) and (level_start_index is not None) and (valid_ratios is not None)
-            if query_embed is None:
-                raise ValueError("query_embed is required for decoding")
+        # decode
+        assert img_memory is not None and text_memory is not None
+        assert (spatial_shapes is not None) and (level_start_index is not None) and (valid_ratios is not None)
+        if query_embed is None:
+            raise ValueError("query_embed is required for decoding")
 
-            tgt = torch.zeros_like(query_embed)  # [Q,B,C]
-            hs = self.decoder(
-                tgt,
-                query_embed,
-                img_memory,
-                spatial_shapes,
-                level_start_index,
-                valid_ratios,
-                memory_key_padding_mask=mask,  # <-- use the actual mask
-                text_memory=text_memory,
-                text_key_padding_mask=text_attention_mask,
-                pos=None,
-            )
-            return hs.transpose(1, 2)  # [L,Q,B,C] -> [L,B,Q,C]
+        tgt = torch.zeros_like(query_embed)  # [Q,B,C]
+        hs = self.decoder(
+            tgt,
+            query_embed,
+            img_memory,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            memory_key_padding_mask=mask,
+            text_memory=text_memory,
+            text_key_padding_mask=text_attention_mask,
+            pos=None,
+        )
+        return hs.transpose(1, 2)  # [L,Q,B,C] -> [L,B,Q,C]
 
 
-# ------------------------- factory (build_transformer) ----------------------
 def build_transformer(args):
     ttype = getattr(args, "transformer_type", "deformable").lower()
     if ttype == "vanilla":
@@ -659,7 +592,6 @@ def build_transformer(args):
             use_text_cross_attn=getattr(args, "use_text_cross_attn", True),
         )
 
-    # default: deformable
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,

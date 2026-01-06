@@ -1,3 +1,10 @@
+"""
+Training/evaluation loops with gradient accumulation and optional EMA.
+
+Logs a small set of primary loss components plus total loss, and can report
+caption↔box alignment misses when a positive map is available.
+"""
+
 import math
 import time
 from typing import Dict, Iterable, Optional
@@ -11,7 +18,7 @@ from mdetr.util.misc import targets_to
 from mdetr.util.optim import adjust_learning_rate, update_ema
 
 
-# Only log the main losses (keep total "loss" too)
+# Loss components to log (total "loss" is logged separately).
 LOG_KEYS = {
     "loss",                    # total weighted loss (includes aux if present)
     "loss_ce",                 # main CE
@@ -23,45 +30,38 @@ LOG_KEYS = {
 
 
 def _update_lr_meters(logger: MetricLogger, optimizer: torch.optim.Optimizer) -> None:
-    """
-    Update per-group learning-rate meters:
-      - lr (base)
-      - lr_backbone (if group exists, has trainable params, and lr > 0)
-      - lr_text (same conditions)
-      - lr_logit (for extra logit scale group if present)
-    """
-    # Ensure the main 'lr' meter exists
+    """Update LR meters for named optimizer groups (base/backbone/text/logit_scales)."""
     if "lr" not in logger.meters:
         logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
-    # Map groups by their explicit 'name' (you set these in main.py)
+    # Param groups keyed by explicit 'name' (as set in main.py).
     group_map = {g.get("name", f"group{i}"): g for i, g in enumerate(optimizer.param_groups)}
 
     def has_trainable_params(g):
         return any(getattr(p, "requires_grad", False) for p in g.get("params", []))
 
-    # Base LR (fallback to first group if "base" isn't named)
+    # Base LR (fallback to first group if "base" isn't named).
     base = group_map.get("base", None)
     if base is None and len(optimizer.param_groups) > 0:
         logger.update(lr=float(optimizer.param_groups[0]["lr"]))
     elif base is not None:
         logger.update(lr=float(base["lr"]))
 
-    # Backbone LR
+    # Backbone LR.
     bb = group_map.get("backbone")
     if bb and float(bb["lr"]) > 0.0 and has_trainable_params(bb):
         if "lr_backbone" not in logger.meters:
             logger.add_meter("lr_backbone", SmoothedValue(window_size=1, fmt="{value:.6f}"))
         logger.update(lr_backbone=float(bb["lr"]))
 
-    # Text encoder LR
+    # Text encoder LR.
     txt = group_map.get("text")
     if txt and float(txt["lr"]) > 0.0 and has_trainable_params(txt):
         if "lr_text" not in logger.meters:
             logger.add_meter("lr_text", SmoothedValue(window_size=1, fmt="{value:.6f}"))
         logger.update(lr_text=float(txt["lr"]))
 
-    # Optional: logit scales (if you add this group via model.extra_optim_groups with name="logit_scales")
+    # Optional: logit scales (added via model.extra_optim_groups with name="logit_scales").
     lg = group_map.get("logit_scales")
     if lg and float(lg["lr"]) > 0.0 and has_trainable_params(lg):
         if "lr_logit" not in logger.meters:
@@ -70,6 +70,7 @@ def _update_lr_meters(logger: MetricLogger, optimizer: torch.optim.Optimizer) ->
 
 
 def _move_targets_to_device(raw_targets, device):
+    """Move tensor-valued target fields to `device` (leaves non-tensors unchanged)."""
     targets = []
     for t in raw_targets:
         td = {}
@@ -86,11 +87,10 @@ def _report_alignment_issues(
     positive_map: Optional[torch.Tensor],
 ) -> None:
     """
-    Print only images that contain at least one GT box with no token alignment.
+    Print only items that have ≥1 GT box with no token alignment.
 
-    We consider a box to have 'no alignment' if its corresponding row in the
-    (batched) positive_map sums to zero. If positive_map isn't available, we
-    fall back to tokens_positive (empty / None span).
+    A box is considered unaligned if its corresponding row in `positive_map` sums to
+    zero. If `positive_map` isn't provided, falls back to `tokens_positive`.
     """
     if raw_targets is None or len(raw_targets) == 0:
         return
@@ -103,7 +103,6 @@ def _report_alignment_issues(
         if k == 0:
             continue
 
-        # Determine which rows (boxes) failed alignment
         failed_rows = []
         if isinstance(positive_map, torch.Tensor):
             pm_slice = positive_map[cur : cur + k] if k > 0 else None
@@ -112,7 +111,6 @@ def _report_alignment_issues(
                 zero_mask = pm_slice.sum(dim=1) == 0
                 failed_rows = torch.nonzero(zero_mask, as_tuple=False).view(-1).cpu().tolist()
         else:
-            # Fallback: inspect tokens_positive if present
             cur += k
             toks = t.get("tokens_positive", [])
             if isinstance(toks, list):
@@ -124,7 +122,6 @@ def _report_alignment_issues(
         if not failed_rows:
             continue
 
-        # Print a compact report for this image/caption
         if not any_printed:
             print(f"[ALIGN-ISSUE][{phase}] step={step_tag}")
             any_printed = True
@@ -137,7 +134,6 @@ def _report_alignment_issues(
         if phrases is None:
             phrases = ["<none>"] * k
 
-        # List failing boxes (limit per image to keep logs reasonable)
         for j in failed_rows:
             ph = phrases[j] if j < len(phrases) else "<none>"
             print(f"   box {j}: phrase={repr(ph)} -> NOT FOUND")
@@ -156,6 +152,7 @@ def train_one_epoch(
     max_norm: float = 0.0,
     model_ema: Optional[nn.Module] = None,
 ):
+    """Train for one epoch with gradient accumulation; step LR schedule per optimizer update."""
     model.train()
     if isinstance(criterion, nn.Module):
         criterion.train()
@@ -166,25 +163,24 @@ def train_one_epoch(
     logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header, print_freq = f"Epoch [{epoch}]", 50
 
-    # Accumulation
     accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
 
-    # Number of optimizer updates this epoch
+    # Number of optimizer updates this epoch.
     num_updates_per_epoch = (len(data_loader) + accum_steps - 1) // accum_steps
     num_steps_total = num_updates_per_epoch * args.epochs
 
     optimizer.zero_grad(set_to_none=True)
     data_iter = iter(data_loader)
 
-    # Drive the progress bar by **updates**, not micro-batches
+    # Iterate by optimizer updates (not micro-batches).
     for update_idx in logger.log_every(range(num_updates_per_epoch), print_freq, header):
         update_start = time.perf_counter()
         micro_batches_done = 0
 
-        # For logging: sum losses across the micro-batches in this update
+        # Sum raw losses across micro-batches for this update.
         loss_sums: Dict[str, torch.Tensor] = {}
 
-        # ---- process up to accum_steps micro-batches ----
+        # Process up to accum_steps micro-batches.
         for _ in range(accum_steps):
             try:
                 batch = next(data_iter)
@@ -210,7 +206,6 @@ def train_one_epoch(
             if isinstance(positive_map, torch.Tensor):
                 _report_alignment_issues("TRAIN", f"e{epoch}/u{update_idx}", raw_targets, positive_map)
             else:
-                # still try with tokens_positive if pos_map absent
                 _report_alignment_issues("TRAIN", f"e{epoch}/u{update_idx}", raw_targets, None)
 
             memory_cache = model(samples, captions, encode_and_save=True)
@@ -218,12 +213,12 @@ def train_one_epoch(
 
             loss_dict: Dict[str, torch.Tensor] = {}
 
-            # Detection losses
+            # Detection losses.
             if (criterion is not None) and (not getattr(args, "no_detection", False)):
                 det_losses = criterion(outputs, targets, positive_map)
                 loss_dict.update(det_losses)
 
-            # Contrastive loss (global image–text)
+            # Contrastive loss (global image–text).
             if (contrastive_criterion is not None) and getattr(args, "contrastive_loss", False):
                 if memory_cache is not None:
                     t_pool = memory_cache.get("text_pooled_op")
@@ -231,40 +226,34 @@ def train_one_epoch(
                     if (t_pool is not None) and (i_pool is not None):
                         loss_dict["contrastive_loss"] = contrastive_criterion(t_pool, i_pool)
 
-            # Total weighted loss for backprop
+            # Total weighted loss used for backprop.
             loss_total = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
 
-            # Safety
             if not math.isfinite(float(loss_total)):
                 reduced = {k: (v.item() if hasattr(v, "item") else v) for k, v in loss_dict.items()}
                 print("Non-finite loss, aborting.", reduced)
                 raise RuntimeError("Non-finite loss encountered.")
 
-            # Backward with accumulation
             (loss_total / accum_steps).backward()
 
-            # For logging: sum raw (unreduced) losses across micro-batches
-            # (detach to avoid graph hold)
+            # Accumulate detached losses for logging.
             for k, v in loss_dict.items():
-                # keep tensors (detached) so reduce_dict can all-reduce later
                 loss_sums[k] = loss_sums.get(k, 0.0) + v.detach()
 
-        # If no micro-batches were left, we’re done
         if micro_batches_done == 0:
             break
 
-        # Correct scaling if the last update used fewer than accum_steps micro-batches
+        # If the final update used fewer micro-batches, rescale grads to match accum_steps.
         if 0 < micro_batches_done < accum_steps:
             corr = accum_steps / float(micro_batches_done)
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad.mul_(corr)
 
-        # Now you can clip on true FP32 grads if desired
         if max_norm and max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
-        # ---- apply schedule BEFORE step ----
+        # Update LR schedule before optimizer.step().
         step_global = epoch * num_updates_per_epoch + update_idx
         adjust_learning_rate(
             optimizer=optimizer,
@@ -291,9 +280,8 @@ def train_one_epoch(
 
         compact = {k: loss_scaled[k] for k in LOG_KEYS if k in loss_scaled}
         logger.update(**compact)
-        logger.update(loss=total_weighted.item())  # total
+        logger.update(loss=total_weighted.item())
 
-        # accurate timing for this optimizer update
         iter_time = time.perf_counter() - update_start
         logger.update(time=iter_time)
 
@@ -314,6 +302,7 @@ def evaluate(
     device: torch.device,
     args,
 ):
+    """Run evaluation and update evaluators (e.g., COCO AP); returns reduced scalar stats."""
     model.eval()
     for crit in (criterion, contrastive_criterion):
         if isinstance(crit, nn.Module):
@@ -334,11 +323,11 @@ def evaluate(
         elif positive_map is not None:
             positive_map = positive_map.to(device)
 
-
-        '''if isinstance(positive_map, torch.Tensor):
-            _report_alignment_issues("EVAL", f"step{eval_step}", targets, positive_map)
-        else:
-            _report_alignment_issues("EVAL", f"step{eval_step}", targets, None)'''
+        # Debug: alignment issue logging (disabled by default).
+        # if isinstance(positive_map, torch.Tensor):
+        #     _report_alignment_issues("EVAL", f"step{eval_step}", targets, positive_map)
+        # else:
+        #     _report_alignment_issues("EVAL", f"step{eval_step}", targets, None)
         eval_step += 1
 
         targets = targets_to(targets, device)
@@ -356,7 +345,6 @@ def evaluate(
                 memory_cache["img_pooled_op"],
             )
 
-        # reduce for logging
         loss_red = dist.reduce_dict(loss_dict)
         loss_scl = {k: loss_red[k] * weight_dict[k] for k in loss_red if k in weight_dict}
         compact = {k: loss_scl[k] for k in LOG_KEYS if k in loss_scl}
@@ -364,7 +352,7 @@ def evaluate(
         if loss_scl:
             logger.update(loss=sum(loss_scl.values()).item())
 
-        # detection eval (COCO-style AP)
+        # Detection eval (COCO-style AP).
         if not getattr(args, "no_detection", False):
             orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
             results = postprocessors["bbox"](outputs, orig_target_sizes)
@@ -394,7 +382,6 @@ def evaluate(
             if hasattr(ce, "tolist"):
                 ce = ce.tolist()
             stats["coco_eval_bbox"] = ce
-            # Convenience keys for external tracking
             stats["ap"] = ce[0]
             stats["ap50"] = ce[1]
             stats["ap75"] = ce[2]

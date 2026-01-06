@@ -1,6 +1,6 @@
-# multimodal_framework/mdetr_g/models/transformer_vanilla.py
+# transformer_vanilla.py
 import copy
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -119,7 +119,7 @@ class TransformerDecoderLayer(nn.Module):
         use_text_cross_attn: bool = True,
     ):
         super().__init__()
-        self.normalize_before = normalize_before
+        self.normalize_before = normalize_before  # kept for interface parity
         self.use_text_cross = use_text_cross_attn
 
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
@@ -231,7 +231,7 @@ class TransformerDecoder(nn.Module):
 class VanillaTransformer(nn.Module):
     """
     Vanilla (no deformable attention) transformer with the *same forward API*
-    as your deformable transformer:
+    as the deformable transformer:
       - encode_and_save=True returns a memory_cache dict
       - encode_and_save=False consumes it and returns hs of shape [L,B,Q,C]
 
@@ -281,7 +281,12 @@ class VanillaTransformer(nn.Module):
             normalize_before=normalize_before,
             use_text_cross_attn=use_text_cross_attn,
         )
-        self.decoder = TransformerDecoder(dec_layer, num_decoder_layers, norm=nn.LayerNorm(d_model), return_intermediate=return_intermediate_dec)
+        self.decoder = TransformerDecoder(
+            dec_layer,
+            num_decoder_layers,
+            norm=nn.LayerNorm(d_model),
+            return_intermediate=return_intermediate_dec,
+        )
 
         # Contrastive: add an image CLS token (like original MDETR)
         self.CLS = nn.Embedding(1, d_model) if contrastive_loss else None
@@ -350,10 +355,9 @@ class VanillaTransformer(nn.Module):
             query_embed_rep = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
             if self.pass_pos_and_query:
-                # standard DETR pattern
                 tgt = torch.zeros_like(query_embed_rep)
             else:
-                # keep legacy MDETR option
+                # legacy option
                 src_seq = src_seq + 0.1 * pos_seq
                 tgt = query_embed_rep
                 query_embed_rep = None
@@ -386,7 +390,8 @@ class VanillaTransformer(nn.Module):
             # Image encoder
             memory = self.encoder(src_seq, src_key_padding_mask=mask_seq, pos=pos_seq)
 
-            img_pooled = memory[0] if self.CLS is not None else None  # [B,C] via CLS
+            # CLS pooled image representation (if enabled)
+            img_pooled = memory[0] if self.CLS is not None else None  # [B,C]
 
             return {
                 "text_memory_resized": text_mem_resized,  # [T,B,C]
@@ -396,7 +401,7 @@ class VanillaTransformer(nn.Module):
                 "pos_embed": pos_seq,                     # [S,B,C]
                 "query_embed": query_embed_rep,           # [Q,B,C]
                 "text_attention_mask": text_kpm,          # [B,T]
-                # keep keys for compatibility with deformable path
+                # compatibility keys with deformable path
                 "spatial_shapes": None,
                 "level_start_index": None,
                 "valid_ratios": None,
@@ -408,10 +413,7 @@ class VanillaTransformer(nn.Module):
         # ---------------- decode ----------------
         assert img_memory is not None and text_memory is not None and query_embed is not None
 
-        if self.pass_pos_and_query:
-            tgt = torch.zeros_like(query_embed)
-        else:
-            tgt = query_embed
+        tgt = torch.zeros_like(query_embed) if self.pass_pos_and_query else query_embed
 
         hs = self.decoder(
             tgt=tgt,

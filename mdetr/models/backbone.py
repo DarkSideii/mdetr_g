@@ -13,10 +13,8 @@ from .position_encoding import build_position_encoding
 import satlaspretrain_models as sat
 
 
-# ---------------------------------------------------------------------------
-# Satlas Aerial Swin
-# ---------------------------------------------------------------------------
 class SatlasAerialSwin(nn.Module):
+    """Satlas Swin backbone adapter that returns the last K feature maps as NestedTensors."""
     def __init__(
         self,
         model_id: str = "Aerial_SwinB_SI",
@@ -30,7 +28,6 @@ class SatlasAerialSwin(nn.Module):
         self.use_fpn = use_fpn
         self.num_levels = num_feature_levels
 
-        # Satlas models support fpn=True/False
         self.weights = sat.Weights()
         self.backbone = self.weights.get_pretrained_model(model_id, fpn=use_fpn)
 
@@ -38,22 +35,19 @@ class SatlasAerialSwin(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
 
-        # Channel list that MDETR will read to build its 1x1 input_projs
         if use_fpn:
             full_channels = [128, 128, 128, 128]  # P3..P6
         else:
-            full_channels = [128, 256, 512, 1024]  # C2..C5 for Swin-B
+            full_channels = [128, 256, 512, 1024]  # C2..C5 (Swin-B)
 
-        # Take the last K levels (consistent with your timm path)
         self.channels = full_channels[-self.num_levels:]
         self.num_channels = self.channels[-1]
 
     def forward(self, tensor_list: NestedTensor) -> OrderedDict:
-        x = tensor_list.tensors  # [B,3,H,W]
-        mask = tensor_list.mask  # [B,H,W] (bool)
+        x = tensor_list.tensors
+        mask = tensor_list.mask
 
-        feats_all = self.backbone(x)  # Satlas returns 4 feature maps
-        # FPN: P3..P6; no-FPN: C2..C5
+        feats_all = self.backbone(x)
         feats = list(feats_all)[-self.num_levels:]
 
         out = OrderedDict()
@@ -63,12 +57,8 @@ class SatlasAerialSwin(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# Normalization helpers
-# ---------------------------------------------------------------------------
 class FrozenBatchNorm2d(torch.nn.Module):
-    """BatchNorm2d where the batch statistics and the affine parameters are fixed."""
-
+    """BatchNorm2d variant with fixed affine params and running statistics."""
     def __init__(self, n: int):
         super().__init__()
         self.register_buffer("weight", torch.ones(n))
@@ -105,11 +95,13 @@ class FrozenBatchNorm2d(torch.nn.Module):
 
 
 class GroupNorm32(torch.nn.GroupNorm):
+    """GroupNorm with 32 groups (common ResNet-GN setting)."""
     def __init__(self, num_channels: int, num_groups: int = 32, **kargs):
         super().__init__(num_groups, num_channels, **kargs)
 
 
 class GN_8(nn.Module):
+    """8-group GroupNorm wrapper."""
     def __init__(self, num_channels: int):
         super().__init__()
         self.gn = torch.nn.GroupNorm(8, num_channels)
@@ -119,7 +111,7 @@ class GN_8(nn.Module):
 
 
 def replace_bn(m: nn.Module, name: str = "") -> None:
-    """Recursively replace BatchNorm2d with FrozenBatchNorm2d in module m."""
+    """Recursively replace BatchNorm2d with FrozenBatchNorm2d."""
     for attr_str in dir(m):
         target_attr = getattr(m, attr_str)
         if isinstance(target_attr, torch.nn.BatchNorm2d):
@@ -134,10 +126,8 @@ def replace_bn(m: nn.Module, name: str = "") -> None:
         replace_bn(ch, n)
 
 
-# ---------------------------------------------------------------------------
-# Backbone bases
-# ---------------------------------------------------------------------------
 class BackboneBase(nn.Module):
+    """IntermediateLayerGetter wrapper that returns NestedTensor feature maps."""
     def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int, return_interm_layers: bool):
         super().__init__()
 
@@ -163,8 +153,7 @@ class BackboneBase(nn.Module):
 
 
 class Backbone(BackboneBase):
-    """ResNet backbone with frozen BatchNorm."""
-
+    """Torchvision ResNet backbone using FrozenBatchNorm2d."""
     def __init__(self, name: str, train_backbone: bool, return_interm_layers: bool, dilation: bool):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
@@ -176,8 +165,7 @@ class Backbone(BackboneBase):
 
 
 class GroupNormBackbone(BackboneBase):
-    """ResNet backbone with GroupNorm with 32 channels."""
-
+    """ResNet backbone with GroupNorm weights loaded from a checkpoint."""
     def __init__(self, name: str, train_backbone: bool, return_interm_layers: bool, dilation: bool):
         name_map = {
             "resnet50-gn": ("resnet50", "/checkpoint/szagoruyko/imagenet/22014122/checkpoint.pth"),
@@ -198,13 +186,13 @@ class GroupNormBackbone(BackboneBase):
 
 def unfreeze_satlas_last2_and_norm(satlas_core: nn.Module) -> None:
     """
-    Freeze all params in a Satlas Swin, then unfreeze:
-    - features.6.* (the penultimate stage: reduction + norm)
-    - features.7.* (the last Swin stage blocks)
-    - norm.* (final global norm)
-    Keep classification head frozen.
+    Freeze all Satlas Swin params, then unfreeze the last two stages and final norm.
+
+    Unfreezes parameter names starting with:
+      - "features.6."
+      - "features.7."
+      - "norm."
     """
-    # freeze everything
     for p in satlas_core.parameters():
         p.requires_grad_(False)
 
@@ -214,27 +202,19 @@ def unfreeze_satlas_last2_and_norm(satlas_core: nn.Module) -> None:
             p.requires_grad_(True)
 
 
-# ---------------------------------------------------------------------------
-# timm backbone (e.g., ConvNeXt) in features_only mode
-# ---------------------------------------------------------------------------
 class TimmBackbone(nn.Module):
-    """
-    timm backbone (e.g., ConvNeXt) in features_only mode.
-    Emits exactly num_feature_levels stages: the last K feature maps.
-    """
-
+    """timm backbone in features_only mode, returning the last K stages as NestedTensors."""
     def __init__(self, name: str, num_feature_levels: int, return_interm_layers: bool):
         super().__init__()
 
-        # Probe how many stages exist
         tmp = create_model(name, pretrained=True, features_only=True)
         all_idx = list(range(len(tmp.feature_info.channels())))
 
         if return_interm_layers and num_feature_levels > 1:
             K = min(num_feature_levels, len(all_idx))
-            out_indices = tuple(all_idx[-K:])  # last K stages
+            out_indices = tuple(all_idx[-K:])
         else:
-            out_indices = (all_idx[-1],)  # single last stage
+            out_indices = (all_idx[-1],)
 
         backbone = create_model(
             name, pretrained=True, in_chans=3, features_only=True, out_indices=out_indices
@@ -244,13 +224,12 @@ class TimmBackbone(nn.Module):
             replace_bn(backbone)
 
         self.body = backbone
-        self.channels = self.body.feature_info.channels()  # length == len(out_indices)
+        self.channels = self.body.feature_info.channels()
         self.num_channels = self.channels[-1]
-        # Expose whether multiple levels are returned (kept for interface parity)
         self.interm = len(self.channels) > 1
 
     def forward(self, tensor_list: NestedTensor) -> OrderedDict:
-        feats = self.body(tensor_list.tensors)  # list length == len(self.channels)
+        feats = self.body(tensor_list.tensors)
         out = OrderedDict()
         for i, x in enumerate(feats):
             mask = F.interpolate(tensor_list.mask[None].float(), size=x.shape[-2:], mode="nearest").bool()[0]
@@ -258,15 +237,13 @@ class TimmBackbone(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# Joiner (backbone + positional encodings)
-# ---------------------------------------------------------------------------
 class Joiner(nn.Sequential):
+    """Backbone wrapper that also returns positional encodings."""
     def __init__(self, backbone: nn.Module, position_embedding: nn.Module):
         super().__init__(backbone, position_embedding)
 
     def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)  # OrderedDict of NestedTensors
+        xs = self[0](tensor_list)
         out, pos = [], []
         for _, x in xs.items():
             out.append(x)
@@ -275,25 +252,20 @@ class Joiner(nn.Sequential):
 
 
 def _normalize_backbone_name(name: str) -> str:
-    """Map user-friendly backbone flags to a valid timm model string."""
+    """Map shorthand backbone names to timm model identifiers."""
     low = name.lower()
     if low == "convnext":
         return "convnext_small"
-    # accept convnext_* variants directly
     if low.startswith("convnext_"):
         return low
     return name
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 def build_backbone(args):
+    """Build the configured vision backbone + position encoding joiner."""
     position_embedding = build_position_encoding(args)
     train_backbone = getattr(args, "lr_backbone", 0.0) > 0.0
 
-    # NOTE: no segmentation => no args.masks. We only return multiple levels when needed
-    # for deformable multi-scale (k>1).
     ttype = getattr(args, "transformer_type", "deformable").lower()
     if ttype == "vanilla":
         k = 1
@@ -303,7 +275,6 @@ def build_backbone(args):
 
     backbone = None
 
-    # ConvNeXt / other timm backbones
     if args.backbone.lower().startswith("convnext") or args.backbone == "ConvNeXt":
         timm_name = _normalize_backbone_name(args.backbone)
         backbone = TimmBackbone(timm_name, num_feature_levels=k, return_interm_layers=return_interm_layers)
@@ -313,29 +284,23 @@ def build_backbone(args):
             model_id="Aerial_SwinB_SI",
             use_fpn=False,
             num_feature_levels=k,
-            train_backbone=(getattr(args, "lr_backbone", 0.0) > 0.0),  # mirror flag, override below if needed
+            train_backbone=(getattr(args, "lr_backbone", 0.0) > 0.0),
         )
 
-        # Only partially unfreeze if we actually want to train the backbone
         if getattr(args, "lr_backbone", 0.0) > 0.0:
-            # Unfreeze features.6.*, features.7.* and global norm.*
             unfreeze_satlas_last2_and_norm(backbone.backbone)
         else:
-            # fully frozen path
             for p in backbone.parameters():
                 p.requires_grad_(False)
             print("Frozen backbone")
             backbone.eval()
 
-    # GroupNorm ResNets
     elif args.backbone in ("resnet50-gn", "resnet101-gn"):
         backbone = GroupNormBackbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
 
-    # Plain torchvision ResNet
     else:
         backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
 
-    # Global freeze if lr_backbone <= 0
     if getattr(args, "lr_backbone", 0.0) <= 0.0:
         for p in backbone.parameters():
             p.requires_grad_(False)

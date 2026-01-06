@@ -1,8 +1,9 @@
-# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
-Transforms and data augmentation for both image + bbox.
+Image/target transforms for detection training.
+
+Targets are expected to contain pixel boxes in xyxy format where applicable.
 """
+
 import random
 
 import PIL
@@ -15,12 +16,12 @@ from mdetr.util.misc import interpolate
 
 
 def crop(image, target, region):
+    """Crop image/target to the given (top, left, height, width) region."""
     cropped_image = F.crop(image, *region)
 
     target = target.copy()
     i, j, h, w = region
 
-    # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
 
     fields = ["labels", "area", "iscrowd", "positive_map", "isfinal"]
@@ -37,14 +38,11 @@ def crop(image, target, region):
         fields.append("boxes")
 
     if "masks" in target:
-        # FIXME should we update the area here if there are no boxes?
         target["masks"] = target["masks"][:, i : i + h, j : j + w]
         fields.append("masks")
 
-    # remove elements for which the boxes or masks that have zero area
+    # Drop elements whose cropped boxes/masks have zero area.
     if "boxes" in target or "masks" in target:
-        # favor boxes selection when defining which elements to keep
-        # this is compatible with previous implementation
         if "boxes" in target:
             cropped_boxes = target["boxes"].reshape(-1, 2, 2)
             keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
@@ -59,6 +57,7 @@ def crop(image, target, region):
 
 
 def hflip(image, target):
+    """Horizontally flip image/target (also swaps 'left'/'right' in caption if present)."""
     flipped_image = F.hflip(image)
 
     w, h = image.size
@@ -80,8 +79,7 @@ def hflip(image, target):
 
 
 def resize(image, target, size, max_size=None):
-    # size can be min_size (scalar) or (w, h) tuple
-
+    """Resize image/target; `size` may be a scalar min_size or a (w,h) tuple."""
     def get_size_with_aspect_ratio(image_size, size, max_size=None):
         w, h = image_size
         if max_size is not None:
@@ -138,12 +136,11 @@ def resize(image, target, size, max_size=None):
 
 
 def pad(image, target, padding):
-    # assumes that we only pad on the bottom right corners
+    """Pad on bottom/right by (pad_x, pad_y)."""
     padded_image = F.pad(image, (0, 0, padding[0], padding[1]))
     if target is None:
         return padded_image, None
     target = target.copy()
-    # should we do something wrt the original size?
     target["size"] = torch.tensor(padded_image[::-1])
     if "masks" in target:
         target["masks"] = torch.nn.functional.pad(target["masks"], (0, padding[0], 0, padding[1]))
@@ -151,6 +148,7 @@ def pad(image, target, padding):
 
 
 class RandomCrop(object):
+    """Random fixed-size crop."""
     def __init__(self, size):
         self.size = size
 
@@ -160,10 +158,11 @@ class RandomCrop(object):
 
 
 class RandomSizeCrop(object):
+    """Random crop with random size; optionally requires preserving all boxes."""
     def __init__(self, min_size: int, max_size: int, respect_boxes: bool = False):
         self.min_size = min_size
         self.max_size = max_size
-        self.respect_boxes = respect_boxes  # if True we can't crop a box out
+        self.respect_boxes = respect_boxes
 
     def __call__(self, img: PIL.Image.Image, target: dict):
         init_boxes = len(target["boxes"])
@@ -179,6 +178,7 @@ class RandomSizeCrop(object):
 
 
 class CenterCrop(object):
+    """Center crop to a fixed size."""
     def __init__(self, size):
         self.size = size
 
@@ -191,6 +191,7 @@ class CenterCrop(object):
 
 
 class RandomHorizontalFlip(object):
+    """Random horizontal flip."""
     def __init__(self, p=0.5):
         self.p = p
 
@@ -201,6 +202,7 @@ class RandomHorizontalFlip(object):
 
 
 class RandomResize(object):
+    """Randomly choose a resize scale from a list."""
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))
         self.sizes = sizes
@@ -212,6 +214,7 @@ class RandomResize(object):
 
 
 class RandomPad(object):
+    """Random pad up to max_pad on each axis."""
     def __init__(self, max_pad):
         self.max_pad = max_pad
 
@@ -222,11 +225,7 @@ class RandomPad(object):
 
 
 class RandomSelect(object):
-    """
-    Randomly selects between transforms1 and transforms2,
-    with probability p for transforms1 and (1 - p) for transforms2
-    """
-
+    """Randomly choose between two transforms with probability p for transforms1."""
     def __init__(self, transforms1, transforms2, p=0.5):
         self.transforms1 = transforms1
         self.transforms2 = transforms2
@@ -239,11 +238,13 @@ class RandomSelect(object):
 
 
 class ToTensor(object):
+    """Convert PIL image to a torch Tensor."""
     def __call__(self, img, target):
         return F.to_tensor(img), target
 
 
 class RandomErasing(object):
+    """Apply torchvision RandomErasing to the image only."""
     def __init__(self, *args, **kwargs):
         self.eraser = T.RandomErasing(*args, **kwargs)
 
@@ -252,6 +253,7 @@ class RandomErasing(object):
 
 
 class Normalize(object):
+    """Normalize image tensor and convert boxes to normalized cxcywh if present."""
     def __init__(self, mean, std):
         self.mean = mean
         self.std = std
@@ -271,6 +273,7 @@ class Normalize(object):
 
 
 class RemoveDifficult(object):
+    """Optionally drop crowd/difficult instances based on target["iscrowd"]."""
     def __init__(self, enabled=False):
         self.remove_difficult = enabled
 
@@ -287,6 +290,7 @@ class RemoveDifficult(object):
 
 
 class Compose(object):
+    """Compose a sequence of (image, target) transforms."""
     def __init__(self, transforms):
         self.transforms = transforms
 

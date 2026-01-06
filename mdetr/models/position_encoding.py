@@ -1,5 +1,3 @@
-# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
 Various positional encodings for the transformer.
 """
@@ -11,8 +9,8 @@ from torch import nn
 
 class PositionEmbeddingSine(nn.Module):
     """
-    This is a more standard version of the position embedding, very similar to the one
-    used by the Attention is all you need paper, generalized to work on images.
+    Standard sine/cosine positional embedding (Attention Is All You Need style),
+    generalized to 2D images.
     """
 
     def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
@@ -30,8 +28,10 @@ class PositionEmbeddingSine(nn.Module):
         x = tensor_list.tensors
         mask = tensor_list.mask
         not_mask = ~mask
+
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
         x_embed = not_mask.cumsum(2, dtype=torch.float32)
+
         if self.normalize:
             eps = 1e-6
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
@@ -49,9 +49,7 @@ class PositionEmbeddingSine(nn.Module):
 
 
 class PositionEmbeddingLearned(nn.Module):
-    """
-    Absolute pos embedding, learned.
-    """
+    """Absolute (learned) positional embedding."""
 
     def __init__(self, num_pos_feats=256):
         super().__init__()
@@ -66,10 +64,12 @@ class PositionEmbeddingLearned(nn.Module):
     def forward(self, tensor_list):
         x = tensor_list.tensors
         h, w = x.shape[-2:]
+
         i = torch.arange(w, device=x.device)
         j = torch.arange(h, device=x.device)
         x_emb = self.col_embed(i)
         y_emb = self.row_embed(j)
+
         pos = (
             torch.cat(
                 [
@@ -88,7 +88,6 @@ class PositionEmbeddingLearned(nn.Module):
 def build_position_encoding(args):
     N_steps = args.hidden_dim // 2
     if args.position_embedding in ("v2", "sine"):
-        # TODO find a better way of exposing other arguments
         position_embedding = PositionEmbeddingSine(N_steps, normalize=True)
     elif args.position_embedding in ("v3", "learned"):
         position_embedding = PositionEmbeddingLearned(N_steps)

@@ -1,10 +1,10 @@
-# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
-COCO dataset which returns image_id for evaluation.
+COCO dataset wrappers used by MDETR.
 
-Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
+Provides datasets that return `image_id` for evaluation and (optionally) token alignment
+maps for phrase grounding.
 """
+
 from pathlib import Path
 
 import torch
@@ -16,6 +16,7 @@ import mdetr.datasets.transforms as T
 
 
 class ModulatedDetection(torchvision.datasets.CocoDetection):
+    """CocoDetection variant that adds caption fields and optional positive_map_eval at eval time."""
     def __init__(self, img_folder, ann_file, transforms, return_masks, return_tokens, tokenizer, is_train=False):
         super(ModulatedDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
@@ -46,6 +47,7 @@ class ModulatedDetection(torchvision.datasets.CocoDetection):
 
 
 class CocoDetection(torchvision.datasets.CocoDetection):
+    """Plain CocoDetection wrapper that returns (image, target) with image_id."""
     def __init__(self, img_folder, ann_file, transforms, return_masks):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
@@ -62,6 +64,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):
+    """Convert polygon segmentations to a stacked boolean mask tensor [N,H,W]."""
     masks = []
     for polygons in segmentations:
         rles = coco_mask.frPyObjects(polygons, height, width)
@@ -79,7 +82,7 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 def create_positive_map(tokenized, tokens_positive):
-    """construct a map such that positive_map[i,j] = True iff box i is associated to token j"""
+    """Build a (boxes x tokens) alignment map over a max_length=256 token space."""
     positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
     for j, tok_list in enumerate(tokens_positive):
         for (beg, end) in tok_list:
@@ -108,6 +111,7 @@ def create_positive_map(tokenized, tokens_positive):
 
 
 class ConvertCocoPolysToMask(object):
+    """Convert COCO annotations to a DETR-style target dict (boxes/labels/masks/tokens)."""
     def __init__(self, return_masks=False, return_tokens=False, tokenizer=None):
         self.return_masks = return_masks
         self.return_tokens = return_tokens
@@ -125,7 +129,6 @@ class ConvertCocoPolysToMask(object):
         anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
 
         boxes = [obj["bbox"] for obj in anno]
-        # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
@@ -177,7 +180,6 @@ class ConvertCocoPolysToMask(object):
 
         if tokens_positive is not None:
             target["tokens_positive"] = []
-
             for i, k in enumerate(keep):
                 if k:
                     target["tokens_positive"].append(tokens_positive[i])
@@ -185,7 +187,6 @@ class ConvertCocoPolysToMask(object):
         if isfinal is not None:
             target["isfinal"] = isfinal
 
-        # for conversion to coco api
         area = torch.tensor([obj["area"] for obj in anno])
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
         target["area"] = area[keep]
@@ -202,7 +203,7 @@ class ConvertCocoPolysToMask(object):
 
 
 def make_coco_transforms(image_set, cautious):
-
+    """Standard COCO transforms for train/val."""
     normalize = T.Compose([T.ToTensor(), T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
@@ -239,6 +240,7 @@ def make_coco_transforms(image_set, cautious):
 
 
 def build(image_set, args):
+    """Build COCO train/val datasets from args.coco_path."""
     root = Path(args.coco_path)
     assert root.exists(), f"provided COCO path {root} does not exist"
     mode = "instances"

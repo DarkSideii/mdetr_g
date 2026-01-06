@@ -1,19 +1,19 @@
-#!/usr/bin/env python3
 """
-Randomly move ~10% of IMAGE+XML *pairs* to a test folder.
+Move a random fraction of image/XML *pairs* into a test directory.
 
-Rules (per your caveats):
-- An image is only eligible if a matching XML exists with the same base name (stem).
-  Example:  abc.jpg  <->  abc.xml
-- When an image is selected, its matching XML is moved too.
-- Inside the test dir you provide, this script creates:
-    "test images"  and  "test xmls"
-- Files are MOVED (so they are removed from the original dirs).
+Only images with a matching `<stem>.xml` are eligible. When an image is selected, its
+matching XML is moved as well.
+
+Creates these subfolders under `--test-dir`:
+  - "test images"
+  - "test xmls"
+
+Files are **moved** (removed from the source dirs).
 
 Examples:
-  python split_pairs_to_test.py --images-dir ./images --xml-dir ./xmls --test-dir ./test
-  python split_pairs_to_test.py --images-dir ./data --xml-dir ./data --test-dir ./test --pct 0.10 --seed 123
-  python split_pairs_to_test.py --images-dir ./images --xml-dir ./xmls --test-dir ./test --dry-run
+  python splits.py --images-dir ./images --xml-dir ./xmls --test-dir ./test
+  python splits.py --images-dir ./data --xml-dir ./data --test-dir ./test --pct 0.10 --seed 123
+  python splits.py --images-dir ./images --xml-dir ./xmls --test-dir ./test --dry-run
 """
 
 from __future__ import annotations
@@ -27,15 +27,17 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def sample_count(n: int, pct: float) -> int:
+    """Return how many items to sample from `n` at fraction `pct` (min 1 when pct>0)."""
     if n <= 0 or pct <= 0:
         return 0
-    k = int(n * pct)  # floor
+    k = int(n * pct)
     if k == 0:
-        k = 1  # ensure at least 1 when pct>0 and there are pairs
+        k = 1  # ensure at least one pair when pct>0
     return min(k, n)
 
 
 def move_file(src: Path, dst_dir: Path, *, overwrite: bool, dry_run: bool) -> None:
+    """Move `src` into `dst_dir`, optionally overwriting. Honors `dry_run`."""
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = dst_dir / src.name
 
@@ -53,6 +55,7 @@ def move_file(src: Path, dst_dir: Path, *, overwrite: bool, dry_run: bool) -> No
 
 
 def main() -> int:
+    """CLI entrypoint."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--images-dir", required=True, help="Directory containing images")
     ap.add_argument("--xml-dir", required=True, help="Directory containing XML files")
@@ -72,13 +75,13 @@ def main() -> int:
     if not xml_dir.is_dir():
         raise NotADirectoryError(f"--xml-dir is not a directory: {xml_dir}")
 
-    # Create required test subdirs (with spaces, exactly as requested)
+    # Destination subdirs (names are fixed, including spaces).
     dst_images = test_dir / "test images"
     dst_xmls = test_dir / "test xmls"
     dst_images.mkdir(parents=True, exist_ok=True)
     dst_xmls.mkdir(parents=True, exist_ok=True)
 
-    # Build list of valid (image, xml) pairs
+    # Eligible pairs: image files with a matching `<stem>.xml`.
     images = [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
 
     pairs: list[tuple[Path, Path]] = []
@@ -102,7 +105,6 @@ def main() -> int:
     print(f"Found {len(pairs)} valid image+xml pair(s). Moving {len(chosen_pairs)} (~{args.pct*100:.1f}%).")
     print(f"Destination folders:\n  {dst_images}\n  {dst_xmls}")
 
-    # Move selected pairs
     for img_path, xml_path in chosen_pairs:
         move_file(img_path, dst_images, overwrite=args.overwrite, dry_run=args.dry_run)
         move_file(xml_path, dst_xmls, overwrite=args.overwrite, dry_run=args.dry_run)
