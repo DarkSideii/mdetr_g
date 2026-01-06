@@ -1,6 +1,6 @@
 # MDETR-G (Modulated Detection Transformer — Geospatial)
 
-MDETR-G is a geospatially adapted variant of **MDETR** for **text-conditioned object detection** in overhead / geospatial imagery. 
+MDETR-G is a geospatially adapted variant of [**MDETR**](https://github.com/ashkamath/mdetr) for **text-conditioned object detection** in overhead / geospatial imagery. 
 It keeps MDETR’s end-to-end “detect what the text describes” formulation, but updates the vision + attention stack to better handle high-resolution 
 geospatial scenes and small targets.
 
@@ -25,8 +25,15 @@ Under the hood, MDETR-G still uses:
 
 Given an image and a natural-language query, MDETR-G predicts bounding boxes corresponding to the referenced objects.
 
+## Data used
 
-## Evaluation note (terminology)
+[DOTA Phrase Grounding](https://drive.google.com/drive/folders/10sYbpxucNDF-EJZAs58-ff9CjNMPdeb9?usp=sharing)
+
+The dataset is a curated subset of the DOTA-v1.5 benchmark, restricted specifically to ship and plane objects found within tiled aerial imagery. To enable phrase grounding, each image is paired with synthetic, object-centric captions that explicitly reference every annotated instance in the scene.
+
+### Dataset structure
+-**train/val**: contains the tiles, annotations, and captions used to train/validate MDETR-G.
+-**test**: contains the tiles, annotations, and captions to test MDETR-G on unseen data. 
 
 ## Training environment
 
@@ -104,3 +111,77 @@ All experiments were ran with **Python 3.11**.
 - 
 **Setup note (pyenv):**
 If you install Python via `pyenv`, make sure `liblzma-dev` is installed *before* building Python, otherwise the stdlib `lzma` module may be missing (`ModuleNotFoundError: No module named '_lzma'`).
+
+## S3 Configurations
+
+This dataset loader is configured to read DOTA images + label TXT files + a captions CSV from Amazon S3, and it uses an S3 client with a botocore.config.Config for retries/timeouts. It also caches parsed annotations locally to speed up future runs (writes dota_annotations.parquet + dota_classes.json).
+
+```json
+{
+  "bucket": "<object-store-bucket-or-container-name>",
+  "images_prefix": "<path/to/images/>",
+  "labels_prefix": "<path/to/labels/>",
+  "csv_key": "<path/to/metadata.csv>",
+  "val_split_ratio": 0.1
+}
+```
+
+## How to run the code examples
+
+**Train**
+```py
+python main.py \
+  --dataset_file dota \
+  --dataset_config configs/dota_config.json \
+  --output_dir runs/mdetr_g \
+  --run_name mdetr_g \
+  --seed 42 \
+  --device cuda \
+  --backbone satlas_aerial_swinb \
+  --transformer_type deformable \
+  --num_feature_levels 3 \
+  --deform_num_points 4 \
+  --no_text_cross_attn \
+  --text_encoder_type sentence-transformers/all-MiniLM-L6-v2 \
+  --freeze_text_encoder \
+  --optimizer adamw \
+  --lr 1e-4 \
+  --lr_backbone 1e-5 \
+  --weight_decay 1e-4 \
+  --schedule step \
+  --epochs 40 \
+  --lr_drop 35 \
+  --batch_size 64 \
+  --enc_layers 3 \
+  --dec_layers 3 \
+  --align_scale_mode learnable \
+  --cls_scale_mode learnable \
+  --logit_scale_lr 5e-6 \
+  --no_contrastive_loss
+```
+
+**Test**
+```py
+python main.py \
+  --eval \
+  --dataset_file dota \
+  --dataset_config configs/dota_config.json \
+  --device cuda \
+  --backbone satlas_aerial_swinb \
+  --transformer_type deformable \
+  --num_feature_levels 3 \
+  --deform_num_points 4 \
+  --no_text_cross_attn \
+  --text_encoder_type sentence-transformers/all-MiniLM-L6-v2 \
+  --freeze_text_encoder \
+  --enc_layers 3 \
+  --dec_layers 3 \
+  --align_scale_mode learnable \
+  --cls_scale_mode learnable \
+  --no_contrastive_loss \
+  --batch_size 16 \
+  --load runs/mdetr_g/BEST_checkpoint.pth
+```
+
+
+
