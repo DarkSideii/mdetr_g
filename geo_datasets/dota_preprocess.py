@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -82,8 +83,11 @@ CAPTION_KEYS = {
 
 # Split caption lists of the form "1. ... 2. ...".
 _SPLIT_RE = re.compile(r"\d+\.\s*")
+
+
 def _split(txt: str) -> list[str]:
     return [p.strip() for p in _SPLIT_RE.split(txt or "") if p.strip()]
+
 
 # Caption augmentation prompt (kept verbatim).
 _CAP_PROMPT = (
@@ -100,9 +104,11 @@ _CAP_PROMPT = (
     "8) Output EXACTLY the lines, with NO numbering, bullets, dashes, or extra headers—just the sentences on separate lines.\n"
 )
 
+
 def _split_sents(txt: str) -> List[str]:
     parts = re.split(r"\d+\.\s*", txt or "")
     return [p.strip() for p in parts if p.strip()]
+
 
 def _call_gpt(existing: List[str], need: int) -> List[str]:
     """Generate up to `need` new caption sentences (best-effort)."""
@@ -139,6 +145,7 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
     ]
     return lines[:need]
 
+
 # Token alignment helpers.
 def create_positive_map(tokenized, tokens_positive):
     """Build a (boxes x tokens) alignment map in the tokenizer's max_length space."""
@@ -171,6 +178,7 @@ def create_positive_map(tokenized, tokens_positive):
 
     return positive_map / (positive_map.sum(-1)[:, None] + 1e-6)
 
+
 def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int, str]]:
     """Find the first case-insensitive match of any candidate; returns (start, end, matched_text)."""
     if not caption:
@@ -179,13 +187,15 @@ def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int
     for w in candidates:
         idx = lower.find(w)
         if idx != -1:
-            return (idx, idx + len(w), caption[idx:idx + len(w)])
+            return (idx, idx + len(w), caption[idx : idx + len(w)])
     return None
+
 
 # PyArrow helpers for cached annotations.
 def _xyxy_to_xywh(b):
     x1, y1, x2, y2 = b
     return [x1, y1, x2 - x1, y2 - y1]
+
 
 def _dict_to_table(d: Dict[int, Dict]) -> pa.Table:
     rows = []
@@ -207,6 +217,7 @@ def _dict_to_table(d: Dict[int, Dict]) -> pa.Table:
                 )
             )
     return pa.Table.from_pylist(rows)
+
 
 def _table_to_dict(t: pa.Table) -> Dict[int, Dict]:
     out: Dict[int, Dict] = {}
@@ -234,6 +245,7 @@ def _table_to_dict(t: pa.Table) -> Dict[int, Dict]:
         )
     return out
 
+
 def _build_coco_like(ann_dict: Dict[int, Dict]) -> Dict:
     imgs, anns, aid = [], [], 0
     for i, rec in ann_dict.items():
@@ -255,20 +267,44 @@ def _build_coco_like(ann_dict: Dict[int, Dict]) -> Dict:
     cats = [{"id": cid, "name": IDX_TO_CLASS[cid]} for cid in sorted(IDX_TO_CLASS)]
     return {"images": imgs, "annotations": anns, "categories": cats, "info": {}, "licenses": []}
 
-@dataclass
-class _S3Sources:
-    bucket: str = "research-geodatasets"
-    images_prefix: str = "DOTAv2/images/"
-    labels_prefix: str = "DOTAv2/labels/"
-    csv_key: str = "DOTAv2/dota_sentencesv2.csv"
 
-def _get_arg_str(args, key: str, default: str) -> str:
-    v = getattr(args, key, None)
-    if v is None:
-        return str(default)
-    if isinstance(v, str) and not v.strip():
-        return str(default)
-    return str(v)
+@dataclass(frozen=True)
+class _S3Sources:
+    bucket: str
+    images_prefix: str
+    labels_prefix: str
+    csv_key: str
+
+
+def _get_cfg_str(
+    args,
+    arg_key: str,
+    env_keys: List[str],
+) -> str:
+    """
+    Get a required string from:
+      1) args.<arg_key> (if present and non-empty)
+      2) the first non-empty environment variable in env_keys (dotenv already loaded)
+    """
+    v = None
+    if args is not None:
+        v = getattr(args, arg_key, None)
+
+    if isinstance(v, str):
+        v = v.strip()
+    if v is not None and str(v).strip():
+        return str(v).strip()
+
+    for ek in env_keys:
+        ev = os.getenv(ek)
+        if ev is not None and str(ev).strip():
+            return str(ev).strip()
+
+    raise ValueError(
+        f"[DOTA] Missing required config for '{arg_key}'. "
+        f"Provide args.{arg_key} or set one of: {', '.join(env_keys)} (e.g. via .env)."
+    )
+
 
 def _get_arg_float(args, key: str, default: float) -> float:
     v = getattr(args, key, None)
@@ -276,38 +312,51 @@ def _get_arg_float(args, key: str, default: float) -> float:
         return float(default)
     return float(v)
 
+
 def _get_arg_int(args, key: str, default: int) -> int:
     v = getattr(args, key, None)
     if v is None:
         return int(default)
     return int(v)
 
+
 def _sources_from_args(args) -> _S3Sources:
-    """Build S3 source config from args (bucket/prefix/key only)."""
-    defaults = _S3Sources()
+    """
+    Build S3 source config from args or environment.
+
+    Required (via args or env):
+      - bucket        / DOTA_S3_BUCKET
+      - images_prefix / DOTA_S3_IMAGES_PREFIX
+      - labels_prefix / DOTA_S3_LABELS_PREFIX
+      - csv_key       / DOTA_S3_CSV_KEY
+    """
     return _S3Sources(
-        bucket=_get_arg_str(args, "bucket", defaults.bucket),
-        images_prefix=_get_arg_str(args, "images_prefix", defaults.images_prefix),
-        labels_prefix=_get_arg_str(args, "labels_prefix", defaults.labels_prefix),
-        csv_key=_get_arg_str(args, "csv_key", defaults.csv_key),
+        bucket=_get_cfg_str(args, "bucket", ["DOTA_S3_BUCKET"]),
+        images_prefix=_get_cfg_str(args, "images_prefix", ["DOTA_S3_IMAGES_PREFIX"]),
+        labels_prefix=_get_cfg_str(args, "labels_prefix", ["DOTA_S3_LABELS_PREFIX"]),
+        csv_key=_get_cfg_str(args, "csv_key", ["DOTA_S3_CSV_KEY"]),
     )
+
 
 class DotaModulatedDetection(Dataset):
     """
     DOTA v2 dataset wrapper (S3-backed) with optional caption augmentation and caching.
     """
+
     def __init__(
         self,
         tokenizer=None,
         return_tokens: bool = False,
         augment_train: bool = False,
-        sources: _S3Sources = _S3Sources(),
+        sources: Optional[_S3Sources] = None,
         val_split_ratio: float = 0.2,
         seed: int = 42,
     ):
         super().__init__()
         self._s3 = None
-        self.sources = sources
+
+        self.sources = sources if sources is not None else _sources_from_args(args=None)
+
         self.seed = seed
         self.prepare = _ConvertDotaToTarget(tokenizer, return_tokens)
 
@@ -561,6 +610,7 @@ class DotaModulatedDetection(Dataset):
         )
         return [ids[i] for i in tr], [ids[i] for i in vl]
 
+
 # Transforms.
 def _dota_transforms(split: str):
     normalize = T.Compose(
@@ -587,8 +637,10 @@ def _dota_transforms(split: str):
     else:
         raise ValueError(split)
 
+
 class _WrappedDataset(torch.utils.data.Dataset):
     """Apply transforms on top of a DotaModulatedDetection dataset."""
+
     def __init__(self, base: DotaModulatedDetection, tfm):
         self.base, self.tfm, self.coco = base, tfm, base.coco
 
@@ -599,6 +651,7 @@ class _WrappedDataset(torch.utils.data.Dataset):
         img, tgt = self.base[idx]
         img, tgt = self.tfm(img, tgt)
         return img, tgt
+
 
 def build_dota(set_name: str, args):
     """
@@ -633,8 +686,10 @@ def build_dota(set_name: str, args):
 
     raise ValueError(set_name)
 
+
 class _ConvertDotaToTarget:
     """Convert a DOTA record into the MDETR-style target dict (with optional token alignment)."""
+
     def __init__(self, tokenizer=None, return_tokens: bool = False):
         self.return_tokens = return_tokens
         self.tokenizer = tokenizer
