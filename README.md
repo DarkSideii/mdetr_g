@@ -49,7 +49,7 @@ All experiments reported for MDETR-G were run on an NVIDIA DGX Spark (Grace Blac
 **System B (Workstation)**
 - GPU: NVIDIA RTX 5000 Ada Generation
 - Memory: 32 GB device (VRAM) (typical RTX 5000 Ada configuration).
-- A requirementsv2,txt is given for specific libraries needed.
+- A requirementsv2.txt is given for specific libraries needed.
   
 Quick sanity checks:
 ```bash
