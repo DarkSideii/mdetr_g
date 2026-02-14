@@ -105,7 +105,7 @@ python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAtte
 All experiments were ran with **Python 3.11**.
 
 **Why 3.11?**
-- On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack we used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
+- On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
 - Python 3.11 generally has the broadest support across the ecosystem for compiled ML/CV dependencies.
 - Workstation used the same version of python.
   
