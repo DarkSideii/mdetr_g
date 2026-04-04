@@ -134,6 +134,21 @@ def get_args_parser():
     p.add_argument("--test_type",                 default="test", choices=("test", "testA", "testB"))
     p.add_argument("--grad_accum_steps",          default=1, type=int, help="Accumulate gradients over N micro-batches before optimizer.step()")
 
+    metrics_group = p.add_mutually_exclusive_group()
+    metrics_group.add_argument(
+        "--eval_token_span_metrics",
+        dest="eval_token_span_metrics",
+        action="store_true",
+        help="Enable eval/test-time contrastive Recall@1/5/10 and token_span_ece.",
+    )
+    metrics_group.add_argument(
+        "--no_eval_token_span_metrics",
+        dest="eval_token_span_metrics",
+        action="store_false",
+        help="Disable eval/test-time contrastive Recall@1/5/10 and token_span_ece.",
+    )
+    p.set_defaults(eval_token_span_metrics=False)
+
     group = p.add_mutually_exclusive_group()
     group.add_argument("--use_text_cross_attn",   dest="use_text_cross_attn", action="store_true", help="Enable decoder cross-attention to text tokens")
     group.add_argument("--no_text_cross_attn",    dest="use_text_cross_attn", action="store_false", help="Disable decoder cross-attention to text tokens")
