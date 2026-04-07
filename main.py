@@ -136,18 +136,18 @@ def get_args_parser():
 
     metrics_group = p.add_mutually_exclusive_group()
     metrics_group.add_argument(
-        "--eval_token_span_metrics",
-        dest="eval_token_span_metrics",
+        "--eval_phrase_box_metrics",
+        dest="eval_phrase_box_metrics",
         action="store_true",
-        help="Enable eval/test-time contrastive Recall@1/5/10 and token_span_ece.",
+        help="Enable eval/test-time phrase->box Recall@1/5/10 and phrase->box ECE@0.50.",
     )
     metrics_group.add_argument(
-        "--no_eval_token_span_metrics",
-        dest="eval_token_span_metrics",
+        "--no_eval_phrase_box_metrics",
+        dest="eval_phrase_box_metrics",
         action="store_false",
-        help="Disable eval/test-time contrastive Recall@1/5/10 and token_span_ece.",
+        help="Disable eval/test-time phrase->box Recall@1/5/10 and phrase->box ECE@0.50.",
     )
-    p.set_defaults(eval_token_span_metrics=False)
+    p.set_defaults(eval_phrase_box_metrics=False)
 
     group = p.add_mutually_exclusive_group()
     group.add_argument("--use_text_cross_attn",   dest="use_text_cross_attn", action="store_true", help="Enable decoder cross-attention to text tokens")
