@@ -225,6 +225,16 @@ def report_trainable_by_group(optimizer, verbose: bool = True):
     }
 
 
+def _sanitize_mlflow_metric_name(name: str) -> str:
+    """
+    MLflow metric names may only contain:
+    alphanumerics, _, -, ., space, :, /
+    """
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./: ")
+    name = name.replace("@", "_at_")
+    return "".join(ch if ch in allowed else "_" for ch in name)
+
+
 def _flatten_metrics_for_mlflow(d, prefix=""):
     """
     Flatten nested metrics into MLflow-safe scalars.
@@ -233,11 +243,13 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
     - 1-element tensors -> item()
     - Multi-element tensors/arrays/lists -> mean/min/max summaries.
     - Dicts are flattened with key/subkey.
+    - Metric names are sanitized for MLflow.
     Non-numeric entries are skipped.
     """
     flat = {}
     for k, v in d.items():
-        name = f"{prefix}{k}" if prefix else k
+        raw_name = f"{prefix}{k}" if prefix else k
+        name = _sanitize_mlflow_metric_name(raw_name)
 
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             flat[name] = float(v)
@@ -249,9 +261,9 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
                 flat[name] = float(v_cpu.item())
             else:
                 arr = v_cpu.flatten().numpy().astype(float)
-                flat[name + "/mean"] = float(arr.mean())
-                flat[name + "/min"] = float(arr.min())
-                flat[name + "/max"] = float(arr.max())
+                flat[_sanitize_mlflow_metric_name(name + "/mean")] = float(arr.mean())
+                flat[_sanitize_mlflow_metric_name(name + "/min")] = float(arr.min())
+                flat[_sanitize_mlflow_metric_name(name + "/max")] = float(arr.max())
             continue
 
         if isinstance(v, (list, tuple, np.ndarray)):
@@ -260,15 +272,15 @@ def _flatten_metrics_for_mlflow(d, prefix=""):
                 if arr.size == 1:
                     flat[name] = float(arr.item())
                 elif arr.size > 1:
-                    flat[name + "/mean"] = float(arr.mean())
-                    flat[name + "/min"] = float(arr.min())
-                    flat[name + "/max"] = float(arr.max())
+                    flat[_sanitize_mlflow_metric_name(name + "/mean")] = float(arr.mean())
+                    flat[_sanitize_mlflow_metric_name(name + "/min")] = float(arr.min())
+                    flat[_sanitize_mlflow_metric_name(name + "/max")] = float(arr.max())
             except Exception:
                 pass
             continue
 
         if isinstance(v, dict):
-            flat.update(_flatten_metrics_for_mlflow(v, prefix=name + "/"))
+            flat.update(_flatten_metrics_for_mlflow(v, prefix=raw_name + "/"))
             continue
 
     return flat
