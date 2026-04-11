@@ -6,3 +6,4 @@ mmcv/
 runs/
 mlruns/
 __pycache__/
+configs/
