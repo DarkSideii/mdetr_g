@@ -1,10 +1,9 @@
+# Copyright (c) 2026 Nicholas Harvey.
+#
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the project root for the full license text.
 """
 DOTA dataset loader/preprocessing for MDETR-style training.
-
-Key behaviors:
-- Reads labels/images from S3 and builds a COCO-like view for evaluation.
-- Caches parsed annotations to a local Parquet file for faster startup.
-- Optionally augments caption lists via GPT (best-effort; training should not crash).
 """
 
 from __future__ import annotations

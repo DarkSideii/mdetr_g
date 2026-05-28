@@ -1,3 +1,9 @@
+# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved.
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+# Modifications Copyright (c) 2026 Nicholas Harvey.
+# Modified for MDETR-G to support geospatial/remote-sensing grounding, training, and evaluation.
+#
+# Licensed under the Apache License, Version 2.0.
 import copy
 from typing import List, Optional
 

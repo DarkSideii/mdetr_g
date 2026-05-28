@@ -1,3 +1,5 @@
+
+# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
 """
 Various utilities related to track and report metrics
 """

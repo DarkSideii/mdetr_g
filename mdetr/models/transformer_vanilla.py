@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Nicholas Harvey.
+#
+# Licensed under the Apache License, Version 2.0.
+
+
 # transformer_vanilla.py
 import copy
 from typing import Optional

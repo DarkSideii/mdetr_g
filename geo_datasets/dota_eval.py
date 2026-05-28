@@ -1,9 +1,8 @@
-"""
-COCO-style evaluator helpers for the DOTA dataset.
 
-Adds an optional class-agnostic export path to avoid dropping predictions when labels
-aren't meaningful COCO category ids.
-"""
+# Copyright (c) 2026 Nicholas Harvey.
+#
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the project root for the full license text.
 
 import numpy as np
 import torch
