@@ -183,5 +183,7 @@ python main.py \
   --load runs/mdetr_g/BEST_checkpoint.pth
 ```
 
+## License
+MDETR-G like MDETR is released under the Apache 2.0 license. Please see the [LICENSE](mdetr_g/LICENSE) file for more information.
 
 
