@@ -193,20 +193,39 @@ class GroupNormBackbone(BackboneBase):
 
 def unfreeze_satlas_last2_and_norm(satlas_core: nn.Module) -> None:
     """
-    Freeze all Satlas Swin params, then unfreeze the last two stages and final norm.
+    Freeze Satlas Swin except its final two feature modules and final LayerNorm.
 
-    Unfreezes parameter names starting with:
-      - "features.6."
-      - "features.7."
-      - "norm."
+    SatlasPretrain may wrap Swin parameter names (e.g.
+    "backbone.backbone.features.7.0.attn.qkv.weight"), so selecting only
+    names beginning with "features.7." silently leaves the backbone frozen.
+    Match complete path components instead of assuming a fixed wrapper depth.
     """
     for p in satlas_core.parameters():
         p.requires_grad_(False)
 
-    allow_prefixes = ("features.6.", "features.7.", "norm.")
-    for n, p in satlas_core.named_parameters():
-        if n.startswith(allow_prefixes):
+    unfrozen_params = 0
+    for name, p in satlas_core.named_parameters():
+        parts = name.split(".")
+        last_stages = any(
+            parts[i] == "features" and parts[i + 1] in ("6", "7")
+            for i in range(len(parts) - 1)
+        )
+        final_norm = (
+            "features" not in parts
+            and len(parts) >= 2
+            and parts[-2] == "norm"
+            and parts[-1] in ("weight", "bias")
+        )
+        if last_stages or final_norm:
             p.requires_grad_(True)
+            unfrozen_params += p.numel()
+
+    if unfrozen_params == 0:
+        raise RuntimeError(
+            "Satlas Swin final features.6/features.7/norm were not found; "
+            "backbone fine-tuning would be silently disabled."
+        )
+    print(f"[Satlas] Trainable final Swin stages and norm: {unfrozen_params:,} parameters")
 
 
 class TimmBackbone(nn.Module):
