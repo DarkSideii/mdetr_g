@@ -1,4 +1,4 @@
-# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache License 2.0. All Rights Reserved
+# Copyright (c) Aishwarya Kamath & Nicolas Carion. Licensed under the Apache 2.0. All Rights Reserved
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 
@@ -45,11 +45,12 @@ def collate_fn(do_round, batch):
     final_batch["targets"] = batch[1]
 
     # Collapse per-sample positive maps across the batch (no padding on box dimension).
+    # These are normalized soft targets: retain fractional weights when batching.
     if "positive_map" in batch[1][0]:
         max_len = max(v["positive_map"].shape[1] for v in batch[1])
         nb_boxes = sum(v["positive_map"].shape[0] for v in batch[1])
 
-        batched_pos_map = torch.zeros((nb_boxes, max_len), dtype=torch.bool)
+        batched_pos_map = torch.zeros((nb_boxes, max_len), dtype=torch.float32)
         cur_count = 0
         for v in batch[1]:
             cur_pos = v["positive_map"]
@@ -63,7 +64,7 @@ def collate_fn(do_round, batch):
         max_len = max(v["positive_map_eval"].shape[1] for v in batch[1])
         nb_boxes = sum(v["positive_map_eval"].shape[0] for v in batch[1])
 
-        batched_pos_map = torch.zeros((nb_boxes, max_len), dtype=torch.bool)
+        batched_pos_map = torch.zeros((nb_boxes, max_len), dtype=torch.float32)
         cur_count = 0
         for v in batch[1]:
             cur_pos = v["positive_map_eval"]
