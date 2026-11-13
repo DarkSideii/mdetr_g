@@ -2,31 +2,24 @@
 #
 # Licensed under the Apache License, Version 2.0.
 # See the LICENSE file in the project root for the full license text.
-"""
-DOTA dataset loader/preprocessing for MDETR-style training.
-"""
+
+"""Ship/plane DOTA loading, caption supervision, and transforms for local or S3 data."""
 
 from __future__ import annotations
 
 import csv
+import copy
+import hashlib
 import io
 import json
 import os
-import random
 import re
 from dataclasses import dataclass
-from botocore.config import Config
-from botocore.exceptions import ClientError
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-import boto3
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
-from datasets import Dataset as HFDataset
 from dotenv import load_dotenv
-from openai import OpenAI
 from PIL import Image
 from pycocotools.coco import COCO
 from sklearn.model_selection import GroupShuffleSplit
@@ -41,40 +34,27 @@ from util.augs import (
     RandomVerticalFlip,
 )
 
-# Global setup.
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 load_dotenv()
-random.seed(42)
 
-# OpenAI is optional; if unavailable, caption augmentation is disabled.
+# Initialize the optional client only when caption generation is requested.
+_openai = None
+_OPENAI_INITIALIZED = False
 _OPENAI_WARNED = False
-try:
-    _openai = OpenAI()
-except Exception as e:
-    _openai = None
-    _OPENAI_WARNED = True
-    print(f"[DOTA] OpenAI client disabled (no API key or init error): {e}")
 
-_S3_CFG = Config(
-    retries={"max_attempts": 10, "mode": "adaptive"},
-    connect_timeout=10,
-    read_timeout=60,
-)
-
-# Cache paths.
 _THIS_DIR = Path(__file__).resolve().parent
 _PARENT_DIR = _THIS_DIR.parent
 _CACHE_DIR = _PARENT_DIR / "dota_cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ARROW_CACHE = _CACHE_DIR / "dota_annotations.parquet"
 CLASSES_JSON = _CACHE_DIR / "dota_classes.json"
 
-# Dataset settings.
 CLASS_NAMES = ["ship", "plane"]
-CLASS_TO_IDX = {name: i + 1 for i, name in enumerate(CLASS_NAMES)}  # contiguous [1..K]
+CLASS_TO_IDX = {name: i + 1 for i, name in enumerate(CLASS_NAMES)}
 IDX_TO_CLASS = {v: k for k, v in CLASS_TO_IDX.items()}
 
-# Caption keyword variants used for token alignment.
 CAPTION_KEYS = {
     "ship": ["ship", "ships"],
     "plane": ["plane", "planes"],
@@ -88,7 +68,12 @@ def _split(txt: str) -> list[str]:
     return [p.strip() for p in _SPLIT_RE.split(txt or "") if p.strip()]
 
 
-# Caption augmentation prompt (kept verbatim).
+def _evaluation_caption(txt: str) -> str:
+    """Choose the first numbered caption (or the original unnumbered caption)."""
+    captions = _split(txt)
+    return captions[0] if captions else (txt or "").strip()
+
+
 _CAP_PROMPT = (
     "Generate NEW sentences that lightly paraphrase the Existing text.\n"
     "\n"
@@ -104,25 +89,29 @@ _CAP_PROMPT = (
 )
 
 
-def _split_sents(txt: str) -> List[str]:
-    parts = re.split(r"\d+\.\s*", txt or "")
-    return [p.strip() for p in parts if p.strip()]
-
-
 def _call_gpt(existing: List[str], need: int) -> List[str]:
     """Generate up to `need` new caption sentences (best-effort)."""
     if need <= 0:
         return []
 
-    global _OPENAI_WARNED
-    if _openai is None:
-        if not _OPENAI_WARNED:
+    global _openai, _OPENAI_INITIALIZED, _OPENAI_WARNED
+    if not _OPENAI_INITIALIZED:
+        _OPENAI_INITIALIZED = True
+        try:
+            from openai import OpenAI
+
+            _openai = OpenAI()
+        except Exception as exc:
             _OPENAI_WARNED = True
-            print("[DOTA] OpenAI client is None -> skipping GPT caption augmentation.")
+            print(f"[DOTA] Caption augmentation unavailable: {exc}")
+    if _openai is None:
         return []
 
-    prefix = (_CAP_PROMPT + "\n\n") if _CAP_PROMPT else ""
-    user_msg = prefix + "Here are the existing sentences:\n" + "\n".join(f"- {s}" for s in existing)
+    user_msg = (
+        _CAP_PROMPT
+        + "\n\nHere are the existing sentences:\n"
+        + "\n".join(f"- {s}" for s in existing)
+    )
 
     try:
         resp = _openai.chat.completions.create(
@@ -136,21 +125,17 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
             print(f"[DOTA] GPT caption augmentation failed; continuing without augmentation: {e}")
         return []
 
-    raw = resp.choices[0].message.content
-    lines = [
-        re.compile(r"^\s*(?:\d+\s*[.)-]?\s*|[-\u2013\u2014*\u2022]+\s+)").sub("", l).strip()
-        for l in raw.split("\n")
-        if l.strip()
-    ]
+    raw = resp.choices[0].message.content or ""
+    line_prefix = re.compile(r"^\s*(?:\d+\s*[.)-]?\s*|[-\u2013\u2014*\u2022]+\s+)")
+    lines = [line_prefix.sub("", line).strip() for line in raw.splitlines() if line.strip()]
     return lines[:need]
 
 
-# Token alignment helpers.
 def create_positive_map(tokenized, tokens_positive):
-    """Build a (boxes x tokens) alignment map in the tokenizer's max_length space."""
+    """Build a normalized (objects, 256) token map from character spans."""
     positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
     for j, tok_list in enumerate(tokens_positive):
-        for (beg, end) in tok_list:
+        for beg, end in tok_list:
             beg_pos = tokenized.char_to_token(beg)
             end_pos = tokenized.char_to_token(end - 1)
 
@@ -190,13 +175,48 @@ def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int
     return None
 
 
-# PyArrow helpers for cached annotations.
 def _xyxy_to_xywh(b):
     x1, y1, x2, y2 = b
     return [x1, y1, x2 - x1, y2 - y1]
 
 
+def _parse_dota_hbb_text(raw_txt: str, width: int, height: int) -> List[Dict]:
+    """Parse original DOTA HBB rows: class_name x1 y1 x2 y2."""
+    annotations = []
+    for ln in raw_txt.splitlines():
+        parts = ln.split()
+        if len(parts) < 5:
+            continue
+        cls_raw = parts[0].lower()
+        if cls_raw not in CLASS_TO_IDX:
+            continue
+        try:
+            x1, y1, x2, y2 = map(float, parts[1:5])
+        except ValueError:
+            continue
+
+        x0 = max(0.0, min(x1, x2))
+        y0 = max(0.0, min(y1, y2))
+        x1c = min(width, max(x1, x2))
+        y1c = min(height, max(y1, y2))
+        if (x1c - x0) < 2 or (y1c - y0) < 2:
+            continue
+
+        annotations.append(
+            dict(
+                bbox=[x0, y0, x1c, y1c],
+                area=float((x1c - x0) * (y1c - y0)),
+                category_id=CLASS_TO_IDX[cls_raw],
+                phrase=cls_raw,
+                iscrowd=0,
+            )
+        )
+    return annotations
+
+
 def _dict_to_table(d: Dict[int, Dict]) -> pa.Table:
+    import pyarrow as pa
+
     rows = []
     for i, rec in d.items():
         for a in rec["annotations"]:
@@ -264,7 +284,13 @@ def _build_coco_like(ann_dict: Dict[int, Dict]) -> Dict:
             aid += 1
 
     cats = [{"id": cid, "name": IDX_TO_CLASS[cid]} for cid in sorted(IDX_TO_CLASS)]
-    return {"images": imgs, "annotations": anns, "categories": cats, "info": {}, "licenses": []}
+    return {
+        "images": imgs,
+        "annotations": anns,
+        "categories": cats,
+        "info": {},
+        "licenses": [],
+    }
 
 
 @dataclass(frozen=True)
@@ -273,6 +299,7 @@ class _S3Sources:
     images_prefix: str
     labels_prefix: str
     csv_key: str
+    dataset_format: str = "s3"
 
 
 def _get_cfg_str(
@@ -280,11 +307,7 @@ def _get_cfg_str(
     arg_key: str,
     env_keys: List[str],
 ) -> str:
-    """
-    Get a required string from:
-      1) args.<arg_key> (if present and non-empty)
-      2) the first non-empty environment variable in env_keys (dotenv already loaded)
-    """
+    """Resolve a required string from arguments, then environment variables."""
     v = None
     if args is not None:
         v = getattr(args, arg_key, None)
@@ -319,28 +342,63 @@ def _get_arg_int(args, key: str, default: int) -> int:
     return int(v)
 
 
-def _sources_from_args(args) -> _S3Sources:
-    """
-    Build S3 source config from args or environment.
+def _local_path(value: str, *, is_dir: bool, key: str) -> str:
+    """Resolve local config paths relative to the repository, not the shell's CWD."""
+    path = Path(os.path.expandvars(value)).expanduser()
+    if not path.is_absolute():
+        path = _PARENT_DIR / path
+    path = path.resolve()
 
-    Required (via args or env):
-      - bucket        / DOTA_S3_BUCKET
-      - images_prefix / DOTA_S3_IMAGES_PREFIX
-      - labels_prefix / DOTA_S3_LABELS_PREFIX
-      - csv_key       / DOTA_S3_CSV_KEY
-    """
+    if is_dir and not path.is_dir():
+        raise FileNotFoundError(f"[DOTA] {key} directory does not exist: {path}")
+    if not is_dir and not path.is_file():
+        raise FileNotFoundError(f"[DOTA] {key} file does not exist: {path}")
+    return str(path)
+
+
+def _sources_from_args(args, set_name: str = "train") -> _S3Sources:
+    """Resolve local/S3 sources; test requires its own paths, not training fallbacks."""
+    if set_name not in {"train", "val", "test"}:
+        raise ValueError(f"[DOTA] Invalid split: {set_name}")
+
+    mode = (
+        str(getattr(args, "dataset_format", None) or os.getenv("DOTA_DATASET_FORMAT", "s3"))
+        .strip()
+        .lower()
+    )
+    if mode not in {"s3", "local"}:
+        raise ValueError("[DOTA] dataset_format must be 's3' or 'local'")
+
+    test = set_name == "test"
+    key_prefix = "test_" if test else ""
+    env_prefix = ("DOTA_LOCAL_" if mode == "local" else "DOTA_S3_") + ("TEST_" if test else "")
+
+    images_key = key_prefix + "images_prefix"
+    labels_key = key_prefix + "labels_prefix"
+    csv_key = key_prefix + "csv_key"
+    images = _get_cfg_str(args, images_key, [env_prefix + "IMAGES_PREFIX"])
+    labels = _get_cfg_str(args, labels_key, [env_prefix + "LABELS_PREFIX"])
+    csv_path = _get_cfg_str(args, csv_key, [env_prefix + "CSV_KEY"])
+
+    if mode == "local":
+        images = _local_path(images, is_dir=True, key=images_key)
+        labels = _local_path(labels, is_dir=True, key=labels_key)
+        csv_path = _local_path(csv_path, is_dir=False, key=csv_key)
+        bucket = ""
+    else:
+        bucket = _get_cfg_str(args, "bucket", ["DOTA_S3_BUCKET"])
+
     return _S3Sources(
-        bucket=_get_cfg_str(args, "bucket", ["DOTA_S3_BUCKET"]),
-        images_prefix=_get_cfg_str(args, "images_prefix", ["DOTA_S3_IMAGES_PREFIX"]),
-        labels_prefix=_get_cfg_str(args, "labels_prefix", ["DOTA_S3_LABELS_PREFIX"]),
-        csv_key=_get_cfg_str(args, "csv_key", ["DOTA_S3_CSV_KEY"]),
+        bucket=bucket,
+        images_prefix=images,
+        labels_prefix=labels,
+        csv_key=csv_path,
+        dataset_format=mode,
     )
 
 
 class DotaModulatedDetection(Dataset):
-    """
-    DOTA v2 dataset wrapper (S3-backed) with optional caption augmentation and caching.
-    """
+    """DOTA annotations, caption sampling, and local/S3 image loading."""
 
     def __init__(
         self,
@@ -350,18 +408,35 @@ class DotaModulatedDetection(Dataset):
         sources: Optional[_S3Sources] = None,
         val_split_ratio: float = 0.2,
         seed: int = 42,
+        set_name: str = "train",
     ):
         super().__init__()
         self._s3 = None
+        if set_name not in {"train", "val", "test"}:
+            raise ValueError(f"[DOTA] Invalid split: {set_name}")
 
         self.sources = sources if sources is not None else _sources_from_args(args=None)
 
         self.seed = seed
         self.prepare = _ConvertDotaToTarget(tokenizer, return_tokens)
 
-        cache_found = ARROW_CACHE.exists() and CLASSES_JSON.exists()
+        # Local data must not reuse annotations from the legacy S3 cache.
+        if self.sources.dataset_format == "local":
+            cache_table = cache_classes = None
+        elif set_name == "test":
+            source_id = json.dumps(self.sources.__dict__, sort_keys=True)
+            fingerprint = hashlib.sha256(source_id.encode()).hexdigest()[:16]
+            cache_table = _CACHE_DIR / f"dota_test_{fingerprint}.parquet"
+            cache_classes = _CACHE_DIR / f"dota_test_{fingerprint}_classes.json"
+        else:
+            # Preserve the old S3 training cache for existing installations.
+            cache_table, cache_classes = ARROW_CACHE, CLASSES_JSON
+
+        cache_found = cache_table is not None and cache_table.exists() and cache_classes.exists()
         if cache_found:
-            ann_raw = _table_to_dict(pq.read_table(ARROW_CACHE))
+            import pyarrow.parquet as pq
+
+            ann_raw = _table_to_dict(pq.read_table(cache_table))
         else:
             ann_raw = self._build_annotations()
 
@@ -369,44 +444,74 @@ class DotaModulatedDetection(Dataset):
         self.ids_all = list(ann_raw)
         self.ids = self.ids_all
 
-        self.ids_train, self.ids_val = self._split_groups(ann_raw, val_split_ratio)
-        if not self.ids_val:
-            n = max(1, int(len(self.ids_all) * val_split_ratio))
-            self.ids_val, self.ids_train = self.ids_all[:n], self.ids_all[n:]
+        if set_name == "test":
+            # Test data is independent and never augmented or split.
+            self.ids_train, self.ids_val = [], []
+            self.ids_all = self._one_caption_per_chip(self.ids_all)
+            self.ids = self.ids_all
+        else:
+            self.ids_train, self.ids_val = self._split_groups(ann_raw, val_split_ratio)
+            if not self.ids_val:
+                n = max(1, int(len(self.ids_all) * val_split_ratio))
+                self.ids_val, self.ids_train = self.ids_all[:n], self.ids_all[n:]
 
-        if not cache_found:
-            new_val_ids = self._explode_captions_no_gpt(ann_raw, only_ids=set(self.ids_val))
-            self.ids_val = list(self.ids_val) + new_val_ids
-
-            if augment_train:
-                before = set(ann_raw.keys())
-                self._augment_captions_once(ann_raw, only_ids=set(self.ids_train))
-                after = set(ann_raw.keys())
-                new_train_ids = sorted(after - before)
+            if set_name == "val":
+                self.ids_val = self._one_caption_per_chip(self.ids_val)
+            elif not cache_found:
+                before = set(ann_raw)
+                if augment_train:
+                    self._augment_captions_once(ann_raw, only_ids=set(self.ids_train))
+                    new_train_ids = sorted(set(ann_raw) - before)
+                else:
+                    # Training still uses every numbered caption as its own sample.
+                    new_train_ids = self._explode_captions_no_gpt(
+                        ann_raw, only_ids=set(self.ids_train)
+                    )
                 self.ids_train = list(self.ids_train) + new_train_ids
 
-        if not cache_found:
-            pq.write_table(_dict_to_table(ann_raw), ARROW_CACHE, compression="zstd")
-            CLASSES_JSON.write_text(json.dumps(CLASS_TO_IDX))
+        if not cache_found and cache_table is not None:
+            import pyarrow.parquet as pq
+
+            cache_table.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(_dict_to_table(ann_raw), cache_table, compression="zstd")
+            cache_classes.write_text(json.dumps(CLASS_TO_IDX))
 
         self.coco = COCO()
         self.coco.dataset = _build_coco_like(self.annotations)
         self.coco.createIndex()
+
+    def _one_caption_per_chip(self, ids: List[int]) -> List[int]:
+        """Keep the lowest-ID copy of each chip and its first numbered caption."""
+        chosen = {}
+        for image_id in sorted(ids):
+            stem = self.annotations[image_id]["filename_stem"]
+            chosen.setdefault(stem, image_id)
+
+        selected = list(chosen.values())
+        for image_id in selected:
+            rec = self.annotations[image_id]
+            rec["caption"] = _evaluation_caption(rec.get("caption", ""))
+        return selected
 
     def __len__(self):
         return len(self.ids)
 
     def __getitem__(self, idx):
         rec = self.annotations[self.ids[idx]]
-        key = rec["image_path"].removeprefix(f"s3://{self.sources.bucket}/")
-        s3 = self._get_s3()
-        img_bin = s3.get_object(Bucket=self.sources.bucket, Key=key)["Body"].read()
-        img = Image.open(io.BytesIO(img_bin)).convert("RGB")
+        if self.sources.dataset_format == "local":
+            with Image.open(rec["image_path"]) as im:
+                img = im.convert("RGB")
+        else:
+            key = rec["image_path"].removeprefix(f"s3://{self.sources.bucket}/")
+            s3 = self._get_s3()
+            img_bin = s3.get_object(Bucket=self.sources.bucket, Key=key)["Body"].read()
+            with Image.open(io.BytesIO(img_bin)) as im:
+                img = im.convert("RGB")
 
         if rec["orig_size"] == (0, 0):
             rec["orig_size"] = img.size[::-1]
 
-        return self.prepare(img, json.loads(json.dumps(rec)))
+        return self.prepare(img, copy.deepcopy(rec))
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -414,13 +519,30 @@ class DotaModulatedDetection(Dataset):
         return state
 
     def _get_s3(self):
+        if self.sources.dataset_format == "local":
+            raise RuntimeError("[DOTA] Local datasets must not open an S3 connection")
         if getattr(self, "_s3", None) is None:
-            self._s3 = boto3.client("s3", config=_S3_CFG)
+            import boto3
+            from botocore.config import Config
+
+            self._s3 = boto3.client(
+                "s3",
+                config=Config(
+                    retries={"max_attempts": 10, "mode": "adaptive"},
+                    connect_timeout=10,
+                    read_timeout=60,
+                ),
+            )
         return self._s3
 
     def _build_annotations(self) -> Dict[int, Dict]:
-        """Scan S3 once and build an annotation dict (TXT HBB -> xyxy) keyed by image_id."""
-        s3 = boto3.client("s3", config=_S3_CFG)
+        """Build an annotation dict from the selected backend (TXT HBB -> xyxy)."""
+        if self.sources.dataset_format == "local":
+            return self._build_annotations_local()
+
+        from botocore.exceptions import ClientError
+
+        s3 = self._get_s3()
 
         csv_rows = list(
             csv.DictReader(
@@ -435,7 +557,9 @@ class DotaModulatedDetection(Dataset):
         paginator = s3.get_paginator("list_objects_v2")
         txt_objs = [
             obj
-            for page in paginator.paginate(Bucket=self.sources.bucket, Prefix=self.sources.labels_prefix)
+            for page in paginator.paginate(
+                Bucket=self.sources.bucket, Prefix=self.sources.labels_prefix
+            )
             for obj in page.get("Contents", [])
             if obj["Key"].endswith(".txt")
         ]
@@ -472,49 +596,108 @@ class DotaModulatedDetection(Dataset):
             )
 
             raw_txt = (
-                s3.get_object(Bucket=self.sources.bucket, Key=obj["Key"])["Body"]
-                .read()
-                .decode()
+                s3.get_object(Bucket=self.sources.bucket, Key=obj["Key"])["Body"].read().decode()
             )
 
-            for ln in raw_txt.splitlines():
-                line = ln.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-
-                cls_raw = parts[0].lower()
-                if cls_raw not in CLASS_TO_IDX:
-                    continue
-
-                try:
-                    x1, y1, x2, y2 = map(float, parts[1:5])
-                except ValueError:
-                    continue
-
-                x0 = max(0.0, min(x1, x2))
-                y0 = max(0.0, min(y1, y2))
-                x1c = min(W, max(x1, x2))
-                y1c = min(H, max(y1, y2))
-                if (x1c - x0) < 2 or (y1c - y0) < 2:
-                    continue
-
-                rec["annotations"].append(
-                    dict(
-                        bbox=[x0, y0, x1c, y1c],
-                        area=float((x1c - x0) * (y1c - y0)),
-                        category_id=CLASS_TO_IDX[cls_raw],
-                        phrase=cls_raw,
-                        iscrowd=0,
-                    )
-                )
+            rec["annotations"] = _parse_dota_hbb_text(raw_txt, W, H)
 
             if rec["annotations"]:
                 ann[img_id] = rec
                 img_id += 1
 
+        return ann
+
+    def _build_annotations_local(self) -> Dict[int, Dict]:
+        """Read the local CSV, image files, and DOTA HBB .txt labels; never call S3."""
+        csv_path = Path(self.sources.csv_key)
+        images_dir = Path(self.sources.images_prefix)
+        labels_dir = Path(self.sources.labels_prefix)
+
+        with csv_path.open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not {"Image", "Description"}.issubset(reader.fieldnames):
+                raise ValueError(f"[DOTA] CSV needs 'Image' and 'Description' columns: {csv_path}")
+            info_by_stem = {}
+            for row_number, row in enumerate(reader, start=2):
+                image_reference = (row.get("Image") or "").strip()
+                if not image_reference:
+                    raise ValueError(f"[DOTA] Empty Image field at {csv_path}:{row_number}")
+                if not (row.get("Description") or "").strip():
+                    raise ValueError(f"[DOTA] Empty Description at {csv_path}:{row_number}")
+                stem = Path(image_reference.replace("\\", "/")).stem
+                if stem in info_by_stem:
+                    raise ValueError(
+                        f"[DOTA] Duplicate CSV image stem '{stem}' at line {row_number}; "
+                        "expected one row per chip with captions in Description"
+                    )
+                info_by_stem[stem] = row
+
+        image_suffixes = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+        images_by_stem = {}
+        for image_path in images_dir.rglob("*"):
+            if not image_path.is_file() or image_path.suffix.lower() not in image_suffixes:
+                continue
+            if image_path.stem in images_by_stem:
+                raise ValueError(
+                    f"[DOTA] Duplicate local image stem '{image_path.stem}': "
+                    f"{images_by_stem[image_path.stem]} and {image_path}"
+                )
+            images_by_stem[image_path.stem] = image_path
+
+        label_paths = sorted(
+            path
+            for path in labels_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() == ".txt"
+        )
+        if not label_paths:
+            raise ValueError(f"[DOTA] No .txt annotations found beneath {labels_dir}")
+
+        ann = {}
+        seen_stems = set()
+        for label_path in tqdm(label_paths, desc="Parsing local DOTA TXT", unit="file"):
+            stem = label_path.stem
+            if stem not in info_by_stem:
+                continue
+            if stem in seen_stems:
+                raise ValueError(f"[DOTA] Multiple annotation files for {stem}")
+            seen_stems.add(stem)
+
+            image_path = images_by_stem.get(stem)
+            if image_path is None:
+                raise FileNotFoundError(
+                    f"[DOTA] CSV and annotation refer to {stem}, but no image "
+                    f"with this stem exists under {images_dir}"
+                )
+
+            with Image.open(image_path) as im:
+                width, height = im.size
+
+            annotations = _parse_dota_hbb_text(
+                label_path.read_text(encoding="utf-8-sig"), width, height
+            )
+            if not annotations:
+                continue
+
+            img_id = len(ann)
+            ann[img_id] = dict(
+                image_id=img_id,
+                image_path=str(image_path),
+                caption=info_by_stem[stem].get("Description", "") or "",
+                filename_stem=stem,
+                orig_size=(height, width),
+                annotations=annotations,
+            )
+
+        if not ann:
+            raise ValueError(
+                f"[DOTA] No usable labeled chips matched between {csv_path}, "
+                f"{images_dir}, and {labels_dir}. Check the config paths and filenames."
+            )
+
+        print(
+            f"[DOTA] Local files: matched {len(ann)} labeled chips from "
+            f"{len(info_by_stem)} CSV rows, no S3 requests"
+        )
         return ann
 
     def _explode_captions_no_gpt(self, ann: Dict[int, Dict], only_ids=None) -> list[int]:
@@ -543,52 +726,29 @@ class DotaModulatedDetection(Dataset):
 
     def _augment_captions_once(self, ann, only_ids=None):
         """Top up per-image caption lists via GPT to a target count (best-effort)."""
-        rows = [
-            {"img_id": k, "stem": v["filename_stem"], "caption": v["caption"]}
-            for k, v in ann.items()
-            if (only_ids is None or k in only_ids)
-        ]
-        ds = HFDataset.from_list(rows).remove_columns(["stem"])
-
-        def _exp(batch):
-            out_id, out_cap = [], []
-            for img_id, cap in zip(batch["img_id"], batch["caption"]):
-                sents_raw = _split(cap)
-                seen, uniq_sents = set(), []
-                for s in sents_raw:
-                    if s and s not in seen:
-                        uniq_sents.append(s)
-                        seen.add(s)
-
-                if 1 <= len(uniq_sents) < 5:
-                    attempts = 0
-                    while len(uniq_sents) < 5 and attempts < 3:
-                        need = 5 - len(uniq_sents)
-                        gens = _call_gpt(uniq_sents, need)
-                        added_any = False
-                        for g in gens:
-                            if g and g not in seen:
-                                uniq_sents.append(g)
-                                seen.add(g)
-                                added_any = True
-                        if not added_any:
-                            break
-                        attempts += 1
-
-                if len(uniq_sents) > 0:
-                    out_id.extend([img_id] * len(uniq_sents))
-                    out_cap.extend(uniq_sents)
-            return {"img_id": out_id, "caption": out_cap}
-
-        ds = ds.map(_exp, batched=True, batch_size=1000, remove_columns=[], load_from_cache_file=False)
-
+        if not ann:
+            return
+        image_ids = [image_id for image_id in ann if only_ids is None or image_id in only_ids]
         nxt = max(ann) + 1
-        bucket: Dict[int, List[str]] = {}
-        for img_id, cap in zip(ds["img_id"], ds["caption"]):
-            bucket.setdefault(img_id, []).append(cap)
-
-        for img_id, caps in bucket.items():
+        for img_id in image_ids:
             base = ann[img_id]
+            caps = list(dict.fromkeys(_split(base["caption"])))
+            if not caps:
+                continue
+            seen = set(caps)
+            for _ in range(3):
+                if len(caps) >= 5:
+                    break
+                generated = _call_gpt(caps, 5 - len(caps))
+                added_any = False
+                for caption in generated:
+                    if caption and caption not in seen:
+                        caps.append(caption)
+                        seen.add(caption)
+                        added_any = True
+                if not added_any:
+                    break
+
             base["caption"] = caps[0]
             for extra in caps[1:]:
                 dup = base.copy()
@@ -610,7 +770,6 @@ class DotaModulatedDetection(Dataset):
         return [ids[i] for i in tr], [ids[i] for i in vl]
 
 
-# Transforms.
 def _dota_transforms(split: str):
     normalize = T.Compose(
         [
@@ -625,16 +784,17 @@ def _dota_transforms(split: str):
                 T.RandomHorizontalFlip(p=0.50),
                 RandomVerticalFlip(prob=0.50),
                 RandomRotate90(prob=0.25),
-                RandomColorJitter(prob=0.25, brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+                RandomColorJitter(
+                    prob=0.25, brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02
+                ),
                 RandomGaussianBlur(prob=0.03, radius=(0.00, 0.15)),
                 T.RandomResize([704], max_size=704),
                 normalize,
             ]
         )
-    elif split == "val":
+    if split == "val":
         return T.Compose([T.RandomResize([704], max_size=704), normalize])
-    else:
-        raise ValueError(split)
+    raise ValueError(split)
 
 
 class _WrappedDataset(torch.utils.data.Dataset):
@@ -653,22 +813,25 @@ class _WrappedDataset(torch.utils.data.Dataset):
 
 
 def build_dota(set_name: str, args):
-    """
-    Build the requested split dataset.
-
-    - train: uses ids_train (+ optional augmentation)
-    - val:   uses ids_val
-    - test:  uses ids_all (no split)
-    """
-    sources = _sources_from_args(args)
+    """Expand training captions; use one caption per chip for validation/test."""
+    sources = _sources_from_args(args, set_name)
+    use_augmentation = (
+        bool(getattr(args, "augment_train", sources.dataset_format == "s3")) and set_name == "train"
+    )
+    print(
+        f"[DOTA] {set_name}: source={sources.dataset_format} "
+        f"CSV={sources.csv_key} images={sources.images_prefix} "
+        f"labels={sources.labels_prefix}"
+    )
 
     full = DotaModulatedDetection(
         tokenizer=args.tokenizer,
         return_tokens=True,
         val_split_ratio=_get_arg_float(args, "val_split_ratio", 0.2),
         seed=_get_arg_int(args, "seed", 42),
-        augment_train=(set_name == "train"),
+        augment_train=use_augmentation,
         sources=sources,
+        set_name=set_name,
     )
 
     if set_name == "train":
@@ -697,18 +860,24 @@ class _ConvertDotaToTarget:
         W, H = image.size
 
         original_annotations = record["annotations"]
-        boxes = torch.as_tensor([a["bbox"] for a in original_annotations], dtype=torch.float32)
+        boxes = torch.as_tensor(
+            [a["bbox"] for a in original_annotations], dtype=torch.float32
+        ).reshape(-1, 4)
         boxes[:, 0::2].clamp_(0, W)
         boxes[:, 1::2].clamp_(0, H)
 
         keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
         boxes = boxes[keep]
 
-        labels_1b = torch.tensor([a["category_id"] for a in original_annotations], dtype=torch.int64)[keep]
+        labels_1b = torch.tensor(
+            [a["category_id"] for a in original_annotations], dtype=torch.int64
+        )[keep]
         labels = labels_1b - 1
 
         area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        iscrowd = torch.tensor([a["iscrowd"] for a in original_annotations], dtype=torch.int64)[keep]
+        iscrowd = torch.tensor([a["iscrowd"] for a in original_annotations], dtype=torch.int64)[
+            keep
+        ]
 
         target = dict(
             boxes=boxes,

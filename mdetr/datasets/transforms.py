@@ -4,88 +4,79 @@
 # Modified for MDETR-G to support geospatial/remote-sensing grounding, training, and evaluation.
 #
 # Licensed under the Apache License, Version 2.0.
-"""
-Image/target transforms for detection training.
 
-Targets are expected to contain pixel boxes in xyxy format where applicable.
-"""
+"""Image/target transforms; pixel xyxy boxes become normalized cxcywh in Normalize."""
 
 import random
 
-import PIL
 import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 from torchvision.transforms import InterpolationMode
+
 from mdetr.util.box_ops import box_xyxy_to_cxcywh
 from mdetr.util.misc import interpolate
 
 
-def crop(image, target, region):
-    """Crop image/target to the given (top, left, height, width) region."""
-    cropped_image = F.crop(image, *region)
+# Box-aligned fields only; evaluation phrases may each refer to multiple boxes.
+_OBJECT_FIELDS = (
+    "boxes",
+    "labels",
+    "area",
+    "iscrowd",
+    "masks",
+    "keypoints",
+    "isfinal",
+    "positive_map",
+    "tokens_positive",
+    "tokens",
+    "phrases_searched",
+)
 
-    target = target.copy()
-    i, j, h, w = region
 
-    target["size"] = torch.tensor([h, w])
-
-    fields = ["labels", "area", "iscrowd", "positive_map", "isfinal"]
-
-    if "boxes" in target:
-        boxes = target["boxes"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
-        cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
-        target["boxes"] = cropped_boxes.reshape(-1, 4)
-        target["area"] = area
-        fields.append("boxes")
-
-    if "masks" in target:
-        target["masks"] = target["masks"][:, i : i + h, j : j + w]
-        fields.append("masks")
-
-    # Drop elements whose cropped boxes/masks have zero area.
-    if "boxes" in target or "masks" in target:
-        if "boxes" in target:
-            cropped_boxes = target["boxes"].reshape(-1, 2, 2)
-            keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
+def _filter_object_fields(target, keep, fields=_OBJECT_FIELDS):
+    """Filter box-aligned tensors and span lists together."""
+    keep_list = None
+    for field in fields:
+        if field not in target:
+            continue
+        values = target[field]
+        if len(values) != len(keep):
+            raise ValueError(f"{field}: {len(values)} rows for {len(keep)} objects")
+        if torch.is_tensor(values):
+            target[field] = values[keep]
         else:
-            keep = target["masks"].flatten(1).any(1)
-
-        for field in fields:
-            if field in target:
-                target[field] = target[field][keep]
-
-    return cropped_image, target
+            if keep_list is None:
+                keep_list = keep.tolist()
+            selected = [value for value, retain in zip(values, keep_list) if retain]
+            target[field] = tuple(selected) if isinstance(values, tuple) else selected
 
 
 def hflip(image, target):
-    """Horizontally flip image/target (also swaps 'left'/'right' in caption if present)."""
+    """Flip image geometry only; preserve captions and all token-span metadata."""
     flipped_image = F.hflip(image)
 
-    w, h = image.size
+    w = image.size[0]
 
+    if target is None:
+        return flipped_image, None
     target = target.copy()
     if "boxes" in target:
         boxes = target["boxes"]
-        boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor(
+            [w, 0, w, 0]
+        )
         target["boxes"] = boxes
 
     if "masks" in target:
         target["masks"] = target["masks"].flip(-1)
-
-    if "caption" in target:
-        caption = target["caption"].replace("left", "[TMP]").replace("right", "left").replace("[TMP]", "right")
-        target["caption"] = caption
 
     return flipped_image, target
 
 
 def resize(image, target, size, max_size=None):
     """Resize image/target; `size` may be a scalar min_size or a (w,h) tuple."""
+
     def get_size_with_aspect_ratio(image_size, size, max_size=None):
         w, h = image_size
         if max_size is not None:
@@ -109,8 +100,7 @@ def resize(image, target, size, max_size=None):
     def get_size(image_size, size, max_size=None):
         if isinstance(size, (list, tuple)):
             return size[::-1]
-        else:
-            return get_size_with_aspect_ratio(image_size, size, max_size)
+        return get_size_with_aspect_ratio(image_size, size, max_size)
 
     size = get_size(image.size, size, max_size)
     rescaled_image = F.resize(image, size, interpolation=InterpolationMode.BICUBIC)
@@ -124,7 +114,9 @@ def resize(image, target, size, max_size=None):
     target = target.copy()
     if "boxes" in target:
         boxes = target["boxes"]
-        scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+        scaled_boxes = boxes * torch.as_tensor(
+            [ratio_width, ratio_height, ratio_width, ratio_height]
+        )
         target["boxes"] = scaled_boxes
 
     if "area" in target:
@@ -136,7 +128,9 @@ def resize(image, target, size, max_size=None):
     target["size"] = torch.tensor([h, w])
 
     if "masks" in target:
-        target["masks"] = interpolate(target["masks"][:, None].float(), size, mode="nearest")[:, 0] > 0.5
+        target["masks"] = (
+            interpolate(target["masks"][:, None].float(), size, mode="nearest")[:, 0] > 0.5
+        )
 
     return rescaled_image, target
 
@@ -147,57 +141,15 @@ def pad(image, target, padding):
     if target is None:
         return padded_image, None
     target = target.copy()
-    target["size"] = torch.tensor(padded_image[::-1])
+    target["size"] = torch.tensor(padded_image.size[::-1])
     if "masks" in target:
         target["masks"] = torch.nn.functional.pad(target["masks"], (0, padding[0], 0, padding[1]))
     return padded_image, target
 
 
-class RandomCrop(object):
-    """Random fixed-size crop."""
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img, target):
-        region = T.RandomCrop.get_params(img, self.size)
-        return crop(img, target, region)
-
-
-class RandomSizeCrop(object):
-    """Random crop with random size; optionally requires preserving all boxes."""
-    def __init__(self, min_size: int, max_size: int, respect_boxes: bool = False):
-        self.min_size = min_size
-        self.max_size = max_size
-        self.respect_boxes = respect_boxes
-
-    def __call__(self, img: PIL.Image.Image, target: dict):
-        init_boxes = len(target["boxes"])
-        max_patience = 100
-        for i in range(max_patience):
-            w = random.randint(self.min_size, min(img.width, self.max_size))
-            h = random.randint(self.min_size, min(img.height, self.max_size))
-            region = T.RandomCrop.get_params(img, [h, w])
-            result_img, result_target = crop(img, target, region)
-            if not self.respect_boxes or len(result_target["boxes"]) == init_boxes or i == max_patience - 1:
-                return result_img, result_target
-        return result_img, result_target
-
-
-class CenterCrop(object):
-    """Center crop to a fixed size."""
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, img, target):
-        image_width, image_height = img.size
-        crop_height, crop_width = self.size
-        crop_top = int(round((image_height - crop_height) / 2.0))
-        crop_left = int(round((image_width - crop_width) / 2.0))
-        return crop(img, target, (crop_top, crop_left, crop_height, crop_width))
-
-
-class RandomHorizontalFlip(object):
+class RandomHorizontalFlip:
     """Random horizontal flip."""
+
     def __init__(self, p=0.5):
         self.p = p
 
@@ -207,8 +159,9 @@ class RandomHorizontalFlip(object):
         return img, target
 
 
-class RandomResize(object):
+class RandomResize:
     """Randomly choose a resize scale from a list."""
+
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))
         self.sizes = sizes
@@ -219,8 +172,9 @@ class RandomResize(object):
         return resize(img, target, size, self.max_size)
 
 
-class RandomPad(object):
+class RandomPad:
     """Random pad up to max_pad on each axis."""
+
     def __init__(self, max_pad):
         self.max_pad = max_pad
 
@@ -230,8 +184,9 @@ class RandomPad(object):
         return pad(img, target, (pad_x, pad_y))
 
 
-class RandomSelect(object):
+class RandomSelect:
     """Randomly choose between two transforms with probability p for transforms1."""
+
     def __init__(self, transforms1, transforms2, p=0.5):
         self.transforms1 = transforms1
         self.transforms2 = transforms2
@@ -243,14 +198,16 @@ class RandomSelect(object):
         return self.transforms2(img, target)
 
 
-class ToTensor(object):
+class ToTensor:
     """Convert PIL image to a torch Tensor."""
+
     def __call__(self, img, target):
         return F.to_tensor(img), target
 
 
-class RandomErasing(object):
+class RandomErasing:
     """Apply torchvision RandomErasing to the image only."""
+
     def __init__(self, *args, **kwargs):
         self.eraser = T.RandomErasing(*args, **kwargs)
 
@@ -258,8 +215,9 @@ class RandomErasing(object):
         return self.eraser(img), target
 
 
-class Normalize(object):
+class Normalize:
     """Normalize image tensor and convert boxes to normalized cxcywh if present."""
+
     def __init__(self, mean, std):
         self.mean = mean
         self.std = std
@@ -278,8 +236,9 @@ class Normalize(object):
         return image, target
 
 
-class RemoveDifficult(object):
+class RemoveDifficult:
     """Optionally drop crowd/difficult instances based on target["iscrowd"]."""
+
     def __init__(self, enabled=False):
         self.remove_difficult = enabled
 
@@ -288,15 +247,13 @@ class RemoveDifficult(object):
             return image, None
         target = target.copy()
         keep = ~target["iscrowd"].to(torch.bool) | (not self.remove_difficult)
-        if "boxes" in target:
-            target["boxes"] = target["boxes"][keep]
-        target["labels"] = target["labels"][keep]
-        target["iscrowd"] = target["iscrowd"][keep]
+        _filter_object_fields(target, keep)
         return image, target
 
 
-class Compose(object):
+class Compose:
     """Compose a sequence of (image, target) transforms."""
+
     def __init__(self, transforms):
         self.transforms = transforms
 
@@ -306,9 +263,5 @@ class Compose(object):
         return image, target
 
     def __repr__(self):
-        format_string = self.__class__.__name__ + "("
-        for t in self.transforms:
-            format_string += "\n"
-            format_string += "    {0}".format(t)
-        format_string += "\n)"
-        return format_string
+        transforms = "".join(f"\n    {transform}" for transform in self.transforms)
+        return f"{self.__class__.__name__}({transforms}\n)"

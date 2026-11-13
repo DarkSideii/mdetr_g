@@ -1,7 +1,11 @@
 {
+  "dataset_format": "s3 or local (pick one)", 
   "bucket": "",
   "images_prefix": "",
   "labels_prefix": "",
   "csv_key": "",
+  "test_images_prefix": "",
+  "test_labels_prefix": "",
+  "test_csv_key": "",
   "val_split_ratio": 0.1
 }
