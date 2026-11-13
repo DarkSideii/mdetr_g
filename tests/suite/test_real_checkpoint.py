@@ -29,7 +29,6 @@ class TestActualCheckpointAndCachedCaptions(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
-                    "DOTA_GV2_OFFLINE": "1",
                     "HF_HUB_OFFLINE": "1",
                     "TRANSFORMERS_OFFLINE": "1",
                     "AWS_EC2_METADATA_DISABLED": "true",

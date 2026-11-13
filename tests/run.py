@@ -113,7 +113,6 @@ def main() -> int:
             parser.error(f"Dataset config not found: {dataset_config}")
 
     environment = {
-        "DOTA_GV2_OFFLINE": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "TOKENIZERS_PARALLELISM": "false",
