@@ -164,15 +164,19 @@ def create_positive_map(tokenized, tokens_positive):
 
 
 def _find_one_of(caption: str, candidates: List[str]) -> Optional[Tuple[int, int, str]]:
-    """Find the first case-insensitive match of any candidate; returns (start, end, matched_text)."""
-    if not caption:
+    """Return the first complete class phrase and its character span."""
+    if not caption or not candidates:
         return None
-    lower = caption.lower()
-    for w in candidates:
-        idx = lower.find(w)
-        if idx != -1:
-            return (idx, idx + len(w), caption[idx : idx + len(w)])
-    return None
+
+    variants = sorted(set(candidates), key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(word) for word in variants) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    match = pattern.search(caption)
+    if match is None:
+        return None
+    return match.start(), match.end(), match.group()
 
 
 def _xyxy_to_xywh(b):
