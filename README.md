@@ -44,7 +44,7 @@ All experiments reported for MDETR-G were run on an NVIDIA DGX Spark (Grace Blac
 - Memory: 128 GB coherent unified system memory (shared between CPU and GPU)
   - Note: tooling may report slightly less usable “GPU memory” due to reservations/overhead.
 - Use requirements.txt for Spark specific library imports
-- See GX Spark specific configurations section for more information
+- See DGX Spark specific configurations section for more information
   
 **System B (Workstation)**
 - GPU: NVIDIA RTX 5000 Ada Generation
@@ -58,7 +58,7 @@ python -c "import torch; print(torch.cuda.get_device_name(0)); print(round(torch
 ```
 ### DGX Spark specific configurations
 
-An venv was created using pyenv’s 3.11.9.
+A venv was created using pyenv’s 3.11.9.
 
 #### Deformable attention (MMCV) on DGX Spark
 
@@ -102,11 +102,11 @@ python -c "from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAtte
 ```
 ## Python version
 
-All experiments were ran with **Python 3.11**.
+All experiments were run with **Python 3.11**.
 
 **Why 3.11?**
 - On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
-- Python 3.11 generally has the broadest support a the ecosystem for compiled ML/CV dependencies.
+- Python 3.11 generally has the broadest support across the ecosystem for compiled ML/CV dependencies.
 - Workstation used the same version of python.
   
 **Setup note (pyenv):**
@@ -130,8 +130,7 @@ Save the configuration you use as `configs/dota_config.json`, or pass a differen
   "test_images_prefix": "data/dota/test/images",
   "test_labels_prefix": "data/dota/test/labels",
   "test_csv_key": "data/dota/test/captions.csv",
-  "val_split_ratio": 0.1,
-  "augment_train": false
+  "val_split_ratio": 0.1
 }
 ```
 
