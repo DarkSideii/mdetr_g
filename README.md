@@ -321,7 +321,7 @@ CUDA_VISIBLE_DEVICES=0 python -u tests/run.py \
 
 ## License
 
-MDETR-G like MDETR is released under the Apache 2.0 license. Please see the [LICENSE](mdetr_g/LICENSE) file for more information.
+MDETR-G like MDETR is released under the Apache 2.0 license. Please see the [LICENSE](LICENSE) file for more information.
 
 
 
