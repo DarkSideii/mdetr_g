@@ -116,7 +116,7 @@ If you install Python via `pyenv`, make sure `liblzma-dev` is installed *before*
 
 The dataset loader can read the same prepared DOTA images + label TXT files + a captions CSV from **local files** or **Amazon S3**. Set `dataset_format` to `"local"` or `"s3"`; the remaining source keys describe directories/files in local mode and prefixes/object keys in S3 mode.
 
-Save the configuration you use as `configs/dota_config.json`, or pass a different filename with `--dataset_config`. The paths below are examples—replace them with the locations of your data. Settings in the JSON take precedence over matching command-line settings.
+Save the configuration you use as `configs/dota_config.json`, or pass a different filename with `--dataset_config`. The paths below are examples—replace them with the locations of your data. 
 
 ### Local files
 
