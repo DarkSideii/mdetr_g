@@ -269,7 +269,7 @@ All paths in this table are relative to `tests/`.
 
 ### Before training
 
-**No checkpoint, dataset download, or JSON file is required for the pre-training tests.** They exercise the production matcher/loss/encoder/decoder with small synthetic inputs and tiny visual/text fixtures. Native MMCV CUDA checks are separate from the reference sampler.
+These tests exercise the production matcher/loss/encoder/decoder with small synthetic inputs and tiny visual/text fixtures. Native MMCV CUDA checks are separate from the reference sampler.
 
 From the repository root, activate your environment and run:
 
@@ -296,9 +296,9 @@ The CPU run uses the reference sampler for synthetic integration and skips nativ
 
 ### After training
 
-Add a **full checkpoint** containing both model weights and training arguments. This repeats the synthetic tests and adds checks of the real model, tokenizer, and a sample of the actual dataset. It does not train or modify the supplied checkpoint; the short optimizer tests operate on disposable synthetic models.
+Add a **full checkpoint** containing both model weights and training arguments. This repeats the synthetic tests and adds checks of the real model, tokenizer, and a sample of the actual dataset.
 
-The runner is strictly offline. Use a local dataset configuration and make sure the Satlas weights and text model/tokenizer files required by model construction are already on disk. An S3 annotation cache alone is not sufficient because the S3 loader still fetches image bytes. If training used S3, save a local version of the configuration and pass its filename with `--dataset-config`.
+Use a local dataset configuration and make sure the Satlas weights and text model/tokenizer files required by model construction are already on disk. An S3 annotation cache alone is not sufficient because the S3 loader still fetches image bytes. If training used S3, save a local version of the configuration and pass its filename with `--dataset-config`.
 
 Example using `configs/dota_config.json` set to `"dataset_format": "local"`:
 
@@ -318,7 +318,7 @@ CUDA_VISIBLE_DEVICES=0 python -u tests/run.py \
 - `--samples 8` checks up to eight image-caption samples, not the entire dataset.
 - The test runner uses `--dataset-config` with a hyphen; `main.py` uses `--dataset_config` with an underscore.
 
-**What passing means:** the checked code paths and data/model contracts behave as expected. It does not prove convergence or a particular AP. The checkpoint check reports best-of-all-query IoU@0.50 hits as a geometry diagnostic, not COCO AP. Use the full **Test** evaluation command above to measure held-out detection performance.
+**What passing means:** the checked code paths and data/model contracts behave as expected. It does not prove convergence or a particular AP. The checkpoint check reports best-of-all-query IoU@0.50 hits as a geometry diagnostic. Use the full **Test** evaluation command above to measure held-out detection performance.
 
 ## License
 
