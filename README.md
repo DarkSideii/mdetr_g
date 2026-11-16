@@ -106,7 +106,7 @@ All experiments were ran with **Python 3.11**.
 
 **Why 3.11?**
 - On DGX Spark (Ubuntu 24.04 defaults to Python 3.12), the ML stack used (**PyTorch cu130 + MMCV CUDA ops**) was validated end-to-end with Python 3.11.
-- Python 3.11 generally has the broadest support across the ecosystem for compiled ML/CV dependencies.
+- Python 3.11 generally has the broadest support a the ecosystem for compiled ML/CV dependencies.
 - Workstation used the same version of python.
   
 **Setup note (pyenv):**
@@ -202,7 +202,6 @@ python main.py \
   --transformer_type deformable \
   --num_feature_levels 3 \
   --deform_num_points 4 \
-  --no_text_cross_attn \
   --text_encoder_type sentence-transformers/all-MiniLM-L6-v2 \
   --freeze_text_encoder \
   --optimizer adamw \
@@ -223,7 +222,7 @@ python main.py \
 
 **Test**
 
-Use the same model settings as training, including the query count and text cross-attention setting. This evaluates the independent `test_*` sources, not the training run's held-out validation split.
+Use the same model settings as training.
 
 ```bash
 python main.py \
@@ -235,7 +234,6 @@ python main.py \
   --transformer_type deformable \
   --num_feature_levels 3 \
   --deform_num_points 4 \
-  --no_text_cross_attn \
   --text_encoder_type sentence-transformers/all-MiniLM-L6-v2 \
   --freeze_text_encoder \
   --enc_layers 3 \
