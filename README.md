@@ -159,8 +159,6 @@ Save the configuration you use as `configs/dota_config.json`, or pass a differen
 - The CSV's `Image` entries should identify the image object key or its `s3://<bucket>/<key>` URI.
 - S3 uses the normal boto3 credential configuration and retries/timeouts. Do not put AWS access keys in the dataset JSON or commit them to the repository.
 
-The local example sets `augment_train` to `false` to use existing captions without new caption-generation API calls. S3 training keeps its existing default: optional caption generation is enabled. Add `"augment_train": false` to the S3 config to disable those calls too. This setting controls caption generation, **not** training image transforms, and does not remove existing cached captions.
-
 ### Data format, splits, and caching
 
 The shipped loader uses the prepared **ship/plane HBB** data described above:
