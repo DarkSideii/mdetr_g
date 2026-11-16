@@ -89,7 +89,7 @@ _CAP_PROMPT = (
 )
 
 
-def _call_gpt(existing: List[str], need: int) -> List[str]:
+def _call_gpt(existing: List[str], need: int, *, model: str) -> List[str]:
     """Generate up to `need` new caption sentences (best-effort)."""
     if need <= 0:
         return []
@@ -115,7 +115,7 @@ def _call_gpt(existing: List[str], need: int) -> List[str]:
 
     try:
         resp = _openai.chat.completions.create(
-            model="gpt-4o",
+            model=model,
             messages=[{"role": "user", "content": user_msg}],
             temperature=0.1,
         )
@@ -413,11 +413,14 @@ class DotaModulatedDetection(Dataset):
         val_split_ratio: float = 0.2,
         seed: int = 42,
         set_name: str = "train",
+        caption_model: Optional[str] = None,
     ):
         super().__init__()
         self._s3 = None
         if set_name not in {"train", "val", "test"}:
             raise ValueError(f"[DOTA] Invalid split: {set_name}")
+
+        self.caption_model = caption_model.strip() if isinstance(caption_model, str) else None
 
         self.sources = sources if sources is not None else _sources_from_args(args=None)
 
@@ -464,6 +467,8 @@ class DotaModulatedDetection(Dataset):
             elif not cache_found:
                 before = set(ann_raw)
                 if augment_train:
+                    if not self.caption_model:
+                        raise ValueError("[DOTA] Caption generation requires a non-empty --caption_model")
                     self._augment_captions_once(ann_raw, only_ids=set(self.ids_train))
                     new_train_ids = sorted(set(ann_raw) - before)
                 else:
@@ -743,7 +748,7 @@ class DotaModulatedDetection(Dataset):
             for _ in range(3):
                 if len(caps) >= 5:
                     break
-                generated = _call_gpt(caps, 5 - len(caps))
+                generated = _call_gpt(caps, 5 - len(caps), model=self.caption_model)
                 added_any = False
                 for caption in generated:
                     if caption and caption not in seen:
@@ -819,9 +824,7 @@ class _WrappedDataset(torch.utils.data.Dataset):
 def build_dota(set_name: str, args):
     """Expand training captions; use one caption per chip for validation/test."""
     sources = _sources_from_args(args, set_name)
-    use_augmentation = (
-        bool(getattr(args, "augment_train", sources.dataset_format == "s3")) and set_name == "train"
-    )
+    use_augmentation = bool(getattr(args, "augment_train", False)) and set_name == "train"
     print(
         f"[DOTA] {set_name}: source={sources.dataset_format} "
         f"CSV={sources.csv_key} images={sources.images_prefix} "
@@ -834,6 +837,7 @@ def build_dota(set_name: str, args):
         val_split_ratio=_get_arg_float(args, "val_split_ratio", 0.2),
         seed=_get_arg_int(args, "seed", 42),
         augment_train=use_augmentation,
+        caption_model=getattr(args, "caption_model", None),
         sources=sources,
         set_name=set_name,
     )

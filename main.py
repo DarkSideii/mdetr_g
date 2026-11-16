@@ -58,6 +58,28 @@ def get_args_parser():
         help="Fraction of training set held out for validation",
     )
 
+    # Caption generation is opt-in and configured only on the command line.
+    caption_group = p.add_mutually_exclusive_group()
+    caption_group.add_argument(
+        "--augment_train",
+        dest="augment_train",
+        action="store_true",
+        help="Generate additional training captions via the API (off by default for local and S3)",
+    )
+    caption_group.add_argument(
+        "--no_augment_train",
+        dest="augment_train",
+        action="store_false",
+        help="Disable new caption generation; does not change image transforms or cached captions",
+    )
+    p.set_defaults(augment_train=False)
+    p.add_argument(
+        "--caption_model",
+        default="gpt-4o",
+        type=str.strip,
+        help="OpenAI Chat Completions model for caption generation (default: %(default)s; command-line only)",
+    )
+
     # Optimization.
     p.add_argument("--batch_size", default=2, type=int)
     p.add_argument("--epochs", default=40, type=int)
@@ -405,19 +427,37 @@ def _validate_runtime_args(args):
     for name in ("batch_size", "grad_accum_steps", "eval_skip"):
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name} must be positive")
+    if getattr(args, "augment_train", False):
+        caption_model = getattr(args, "caption_model", None)
+        if not isinstance(caption_model, str) or not caption_model.strip():
+            raise ValueError("--caption_model must be non-empty when --augment_train is enabled")
     checkpoint_path = args.load or args.resume
     if checkpoint_path and not Path(checkpoint_path).is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
 
-def main(args):
-    # Dataset configuration retains precedence over CLI arguments.
+def _load_dataset_config(args):
+    """Apply dataset overrides without changing CLI-only caption options."""
     if args.dataset_config:
         with open(args.dataset_config, encoding="utf-8") as f:
             config = json.load(f)
         if not isinstance(config, dict):
             raise ValueError("Dataset configuration must be a JSON object")
-        vars(args).update(config)
+        cli_only = {"augment_train", "caption_model"}
+        ignored = cli_only.intersection(config)
+        if ignored:
+            warnings.warn(
+                "Ignoring CLI-only caption options in dataset config: "
+                + ", ".join(sorted(ignored))
+                + ". Use --augment_train/--no_augment_train and --caption_model instead.",
+                stacklevel=2,
+            )
+        # Preserve the existing JSON precedence for all other settings.
+        vars(args).update({key: value for key, value in config.items() if key not in cli_only})
+
+
+def main(args):
+    _load_dataset_config(args)
 
     _validate_runtime_args(args)
 
