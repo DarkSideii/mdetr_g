@@ -41,7 +41,12 @@ def _mean_pool(last_hidden: Tensor, attn_mask: Tensor) -> Tensor:
 
 
 class _MSDeformAttnWrapper(nn.Module):
-    """Adapt MMCV tensor layouts while retaining its native residual behavior."""
+    """Adapt MMCV tensor layouts; return attention update without an internal residual.
+
+    Encoder/decoder layers already own the residual and attention dropout.
+    This matches original Deformable DETR rather than MMCV's default contract.
+    Requires MMCV 2.2.0 (the version used for this experiment).
+    """
 
     def __init__(self, d_model: int, n_levels: int, n_heads: int, n_points: int):
         super().__init__()
@@ -51,20 +56,17 @@ class _MSDeformAttnWrapper(nn.Module):
                 "Install a wheel that matches your Torch/CUDA."
             )
 
-        try:
-            mod = _MMCV_MSDA(
-                embed_dims=d_model,
-                num_heads=n_heads,
-                num_levels=n_levels,
-                num_points=n_points,
-                batch_first=True,
-            )
-            self.batch_first = True
-        except TypeError:
-            mod = _MMCV_MSDA(d_model, n_heads, n_levels, n_points)
-            self.batch_first = getattr(mod, "batch_first", False)
-
-        self.mod = mod
+        # The outer encoder/decoder layer applies the sole attention dropout.
+        # Disable MMCV's internal dropout to avoid applying dropout twice.
+        self.mod = _MMCV_MSDA(
+            embed_dims=d_model,
+            num_heads=n_heads,
+            num_levels=n_levels,
+            num_points=n_points,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.batch_first = True
 
     def forward(
         self,
@@ -99,19 +101,18 @@ class _MSDeformAttnWrapper(nn.Module):
                 f"spatial_shapes={spatial_shapes.tolist()}, batch_first={self.batch_first}"
             )
 
-        try:
-            out = self.mod(
-                query=q,
-                reference_points=reference_points,
-                value=v,
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-                key_padding_mask=key_padding_mask,
-            )
-        except TypeError:
-            out = self.mod(
-                q, reference_points, v, spatial_shapes, level_start_index, key_padding_mask
-            )
+        # MMCV adds 'identity' internally (default: query). Supplying zeros
+        # returns only the attention update; the caller adds src/tgt once.
+        # In particular, positional embeddings in q do NOT leak into identity.
+        out = self.mod(
+            query=q,
+            reference_points=reference_points,
+            value=v,
+            identity=torch.zeros_like(q),
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            key_padding_mask=key_padding_mask,
+        )
 
         return out.transpose(0, 1).contiguous() if self.batch_first else out.contiguous()
 
