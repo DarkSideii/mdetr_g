@@ -41,7 +41,7 @@ def _mean_pool(last_hidden: Tensor, attn_mask: Tensor) -> Tensor:
 
 
 class _MSDeformAttnWrapper(nn.Module):
-    """Adapt MMCV tensor layouts while retaining its native residual behavior."""
+    """Adapt MMCV tensor layouts; outer transformer layers own the residual."""
 
     def __init__(self, d_model: int, n_levels: int, n_heads: int, n_points: int):
         super().__init__()
@@ -58,6 +58,7 @@ class _MSDeformAttnWrapper(nn.Module):
                 num_levels=n_levels,
                 num_points=n_points,
                 batch_first=True,
+                dropout=0.0,
             )
             self.batch_first = True
         except TypeError:
@@ -102,16 +103,17 @@ class _MSDeformAttnWrapper(nn.Module):
         try:
             out = self.mod(
                 query=q,
+                identity=torch.zeros_like(q),
                 reference_points=reference_points,
                 value=v,
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 key_padding_mask=key_padding_mask,
             )
-        except TypeError:
-            out = self.mod(
-                q, reference_points, v, spatial_shapes, level_start_index, key_padding_mask
-            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "Single-residual attention requires MMCV's keyword API."
+            ) from exc
 
         return out.transpose(0, 1).contiguous() if self.batch_first else out.contiguous()
 
